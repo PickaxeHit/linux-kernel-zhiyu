@@ -166,6 +166,14 @@ static const struct of_device_id qcom_ubwc_configs[] __maybe_unused = {
 	{ .compatible = "qcom,sm8750", .data = &ubwc_5_0_hbb16, },
 	{ .compatible = "qcom,x1e80100", .data = &ubwc_4_0_hbb16, },
 	{ .compatible = "qcom,x1p42100", .data = &ubwc_4_0_hbb16, },
+	/*
+	 * The bootloader hands us the downstream device tree, which uses the
+	 * "sun"/"sunp" codenames for SM8750 as the machine compatible.  Without
+	 * these aliases qcom_ubwc_cfg_get() returns -EINVAL and both the Adreno
+	 * GPU and the DPU fail to probe.
+	 */
+	{ .compatible = "qcom,sun", .data = &ubwc_5_0_hbb16, },
+	{ .compatible = "qcom,sunp", .data = &ubwc_5_0_hbb16, },
 	{ }
 };
 

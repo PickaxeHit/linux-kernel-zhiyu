@@ -6,6 +6,10 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/dma-mapping.h>
+
+static bool dump_gpr_rsp;
+module_param(dump_gpr_rsp, bool, 0644);
 #include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/sched.h>
@@ -38,6 +42,205 @@ int q6apm_send_cmd_sync(struct q6apm *apm, const struct gpr_pkt *pkt,
 					NULL, &apm->wait, pkt, rsp_opcode);
 }
 
+
+/*
+ * GRAPH_OPEN payload captured from the stock Android HAL (frida) for the
+ * playback device graph: subgraph 0xb0000002 / container 0xe0000002 with
+ * SAL, two data loggers, 0x07001011, TDM_SINK, an ACDB module and an MFC.
+ * Replaying it verbatim lets us test the vendor's exact graph without having
+ * to describe those modules in the topology.
+ */
+static bool vendor_replay;
+module_param(vendor_replay, bool, 0644);
+
+static const u32 vendor_dev_graph_payload[] = {
+	0x00000001, 0x08001001, 0x0000004c, 0x00000000, 0x00000001, 0xb0000002, 0x00000005, 0x0800100e,
+	0x00000004, 0x00000002, 0x0800100f, 0x00000004, 0x00000002, 0x08001010, 0x00000004, 0xffffffff,
+	0x08001374, 0x00000008, 0x00100000, 0x00000010, 0x08001531, 0x00000004, 0x00000010, 0x00000000,
+	0x00000001, 0x08001000, 0x00000064, 0x00000000, 0x00000001, 0xe0000002, 0x00000007, 0x08001011,
+	0x00000008, 0x00000001, 0x0b001001, 0x08001012, 0x00000004, 0x00000004, 0x08001013, 0x00000004,
+	0x00001000, 0x08001014, 0x00000004, 0x00000002, 0x08001174, 0x00000004, 0x00000001, 0x080010cb,
+	0x00000004, 0xffffffff, 0x0800124d, 0x00000004, 0x00000001, 0x00000000, 0x00000001, 0x08001002,
+	0x00000040, 0x00000000, 0x00000001, 0xb0000002, 0xe0000002, 0x00000006, 0x07001010, 0x00004012,
+	0x0700101a, 0x00004007, 0x07001011, 0x0000418e, 0x0700101a, 0x00004617, 0x0700100e, 0x000049f6,
+	0x07001015, 0x00004a7c, 0x00000001, 0x08001003, 0x00000094, 0x00000000, 0x00000006, 0x00004012,
+	0x00000001, 0x08001015, 0x00000008, 0x00000019, 0x00000001, 0x00004007, 0x00000001, 0x08001015,
+	0x00000008, 0x00000001, 0x00000001, 0x0000418e, 0x00000001, 0x08001015, 0x00000008, 0x00000001,
+	0x00000017, 0x00004617, 0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x000049f6,
+	0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000000, 0x00004a7c, 0x00000001, 0x08001015,
+	0x00000008, 0x00000001, 0x00000001, 0x00000000, 0x00000001, 0x08001004, 0x00000104, 0x00000000,
+	0x00000010, 0x0000418e, 0x00000001, 0x00004007, 0x00000002, 0x0000418e, 0x0000000f, 0x000041e2,
+	0x00000004, 0x0000418e, 0x00000003, 0x00004423, 0x00000004, 0x0000418e, 0x00000019, 0x00004436,
+	0x00000004, 0x0000418e, 0x00000007, 0x000044e8, 0x00000002, 0x0000418e, 0x00000003, 0x000048f3,
+	0x00000004, 0x0000418e, 0x00000019, 0x0000490a, 0x00000004, 0x00004312, 0x00000001, 0x00004012,
+	0x00000026, 0x00004312, 0x00000001, 0x00004012, 0x0000002c, 0x0000418e, 0x0000001b, 0x000049d1,
+	0x00000002, 0x0000418e, 0x0000001d, 0x0000467e, 0x00000004, 0x0000418e, 0x0000002d, 0x00004a11,
+	0x00000002, 0x00004007, 0x00000001, 0x000049f6, 0x00000002, 0x00004617, 0x00000001, 0x0000418e,
+	0x00000002, 0x00004012, 0x00000001, 0x00004a7c, 0x00000002, 0x00004a7c, 0x00000001, 0x00004617,
+	0x00000002, 0x00000000, 0x00000001, 0x08001061, 0x00000004, 0x00000000, 0x00000000, 0x00000000,
+	0x00000001, 0x08001001, 0x0000004c, 0x00000000, 0x00000001, 0xb0000008, 0x00000005, 0x0800100e,
+	0x00000004, 0x00000001, 0x0800100f, 0x00000004, 0x00000002, 0x08001010, 0x00000004, 0xffffffff,
+	0x08001374, 0x00000008, 0x00100000, 0x00000010, 0x08001531, 0x00000004, 0x00000010, 0x00000000,
+	0x00000001, 0x08001000, 0x00000064, 0x00000000, 0x00000001, 0xe0000009, 0x00000007, 0x08001011,
+	0x00000008, 0x00000001, 0x0b001000, 0x08001012, 0x00000004, 0x00000002, 0x08001013, 0x00000004,
+	0x00002000, 0x08001014, 0x00000004, 0x00000002, 0x08001174, 0x00000004, 0x00000001, 0x080010cb,
+	0x00000004, 0xffffffff, 0x0800124d, 0x00000004, 0x00000001, 0x00000000, 0x00000001, 0x08001002,
+	0x00000060, 0x00000000, 0x00000001, 0xb0000008, 0xe0000009, 0x0000000a, 0x0700101a, 0x0000401c,
+	0x07001015, 0x0000401d, 0x07001017, 0x00004017, 0x0700101a, 0x00004016, 0x07001010, 0x00004061,
+	0x07001038, 0x00004062, 0x07001014, 0x000040e5, 0x07001015, 0x00004174, 0x0700105b, 0x000045b3,
+	0x0700101b, 0x0000404f, 0x00000001, 0x08001003, 0x000000f4, 0x00000000, 0x0000000a, 0x0000401c,
+	0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x0000401d, 0x00000001, 0x08001015,
+	0x00000008, 0x00000001, 0x00000001, 0x00004017, 0x00000001, 0x08001015, 0x00000008, 0x00000001,
+	0x00000001, 0x00004016, 0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x00004061,
+	0x00000001, 0x08001015, 0x00000008, 0x00000004, 0x00000001, 0x00004062, 0x00000001, 0x08001015,
+	0x00000008, 0x00000003, 0x00000004, 0x000040e5, 0x00000001, 0x08001015, 0x00000008, 0x00000001,
+	0x00000001, 0x00004174, 0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x000045b3,
+	0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x0000404f, 0x00000001, 0x08001015,
+	0x00000008, 0x00000001, 0x00000001, 0x00000000, 0x00000001, 0x08001004, 0x000000c4, 0x00000000,
+	0x0000000c, 0x0000401c, 0x00000001, 0x0000401d, 0x00000002, 0x00004017, 0x00000001, 0x00004016,
+	0x00000002, 0x00004062, 0x00000005, 0x00004061, 0x00000002, 0x00004062, 0x00000007, 0x00004061,
+	0x00000004, 0x00004062, 0x00000009, 0x00004061, 0x00000006, 0x00004061, 0x00000001, 0x0000401c,
+	0x00000002, 0x000040e5, 0x00000001, 0x00004017, 0x00000002, 0x0000401d, 0x00000001, 0x000045b3,
+	0x00000002, 0x000045b3, 0x00000001, 0x000040e5, 0x00000002, 0x00004062, 0x0000000b, 0x00004061,
+	0x00000008, 0x00004016, 0x00000001, 0x0000404f, 0x00000002, 0x0000404f, 0x00000001, 0x00004174,
+	0x00000002, 0x00000000, 0x00000001, 0x08001001, 0x0000004c, 0x00000000, 0x00000001, 0xb000001c,
+	0x00000005, 0x0800100e, 0x00000004, 0x00000001, 0x0800100f, 0x00000004, 0x00000002, 0x08001010,
+	0x00000004, 0x00000001, 0x08001374, 0x00000008, 0x00100000, 0x00000010, 0x08001531, 0x00000004,
+	0x00000010, 0x00000000, 0x00000001, 0x08001000, 0x00000064, 0x00000000, 0x00000001, 0xe0000024,
+	0x00000007, 0x08001014, 0x00000004, 0x00000002, 0x08001013, 0x00000004, 0x00001000, 0x08001011,
+	0x00000008, 0x00000001, 0x0b001000, 0x08001012, 0x00000004, 0x00000002, 0x08001174, 0x00000004,
+	0x00000001, 0x080010cb, 0x00000004, 0xffffffff, 0x0800124d, 0x00000004, 0x00000001, 0x00000000,
+	0x00000001, 0x08001002, 0x00000018, 0x00000000, 0x00000001, 0xb000001c, 0xe0000024, 0x00000001,
+	0x07001015, 0x000040b6, 0x00000001, 0x08001003, 0x0000001c, 0x00000000, 0x00000001, 0x000040b6,
+	0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x00000000, 0x00000001, 0x08001001,
+	0x0000004c, 0x00000000, 0x00000001, 0xb0000001, 0x00000005, 0x0800100e, 0x00000004, 0x00000001,
+	0x0800100f, 0x00000004, 0x00000002, 0x08001010, 0x00000004, 0x00000001, 0x08001374, 0x00000008,
+	0x00100000, 0x00000010, 0x08001531, 0x00000004, 0x00000010, 0x00000000, 0x00000001, 0x08001000,
+	0x00000124, 0x00000000, 0x00000003, 0xe0000001, 0x00000007, 0x08001011, 0x00000008, 0x00000001,
+	0x0b001001, 0x08001012, 0x00000004, 0x00000001, 0x08001013, 0x00000004, 0x00001000, 0x08001014,
+	0x00000004, 0x00000002, 0x08001174, 0x00000004, 0x00000001, 0x080010cb, 0x00000004, 0xffffffff,
+	0x0800124d, 0x00000004, 0x00000001, 0xe0000008, 0x00000007, 0x08001011, 0x00000008, 0x00000001,
+	0x0b001000, 0x08001012, 0x00000004, 0x00000001, 0x08001013, 0x00000004, 0x00001000, 0x08001014,
+	0x00000004, 0x00000002, 0x08001174, 0x00000004, 0x00000001, 0x080010cb, 0x00000004, 0xffffffff,
+	0x0800124d, 0x00000004, 0x00000001, 0xe0000016, 0x00000007, 0x08001014, 0x00000004, 0x00000002,
+	0x08001013, 0x00000004, 0x00001000, 0x08001011, 0x00000008, 0x00000001, 0x0b001001, 0x08001012,
+	0x00000004, 0x00000001, 0x08001174, 0x00000004, 0x00000001, 0x080010cb, 0x00000004, 0xffffffff,
+	0x0800124d, 0x00000004, 0x00000001, 0x00000000, 0x00000001, 0x08001002, 0x00000078, 0x00000000,
+	0x00000003, 0xb0000001, 0xe0000001, 0x00000005, 0x07001000, 0x00004001, 0x0700101a, 0x00004002,
+	0x07001005, 0x00004003, 0x07001003, 0x00004004, 0x0700101a, 0x00004005, 0xb0000001, 0xe0000008,
+	0x00000004, 0x0700101a, 0x00004018, 0x0700101b, 0x0000401f, 0x07001019, 0x00004019, 0x0700101a,
+	0x0000401b, 0xb0000001, 0xe0000016, 0x00000001, 0x07001032, 0x00004163, 0x00000001, 0x08001003,
+	0x000000f4, 0x00000000, 0x0000000a, 0x00004001, 0x00000001, 0x08001015, 0x00000008, 0x00000000,
+	0x00000001, 0x00004002, 0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x00004003,
+	0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x00004004, 0x00000001, 0x08001015,
+	0x00000008, 0x00000001, 0x00000001, 0x00004005, 0x00000001, 0x08001015, 0x00000008, 0x00000001,
+	0x00000001, 0x00004018, 0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x0000401f,
+	0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000001, 0x00004019, 0x00000001, 0x08001015,
+	0x00000008, 0x00000001, 0x00000001, 0x0000401b, 0x00000001, 0x08001015, 0x00000008, 0x00000001,
+	0x00000001, 0x00004163, 0x00000001, 0x08001015, 0x00000008, 0x00000001, 0x00000009, 0x00000000,
+	0x00000001, 0x08001004, 0x00000094, 0x00000000, 0x00000009, 0x00004001, 0x00000001, 0x00004002,
+	0x00000002, 0x00004002, 0x00000001, 0x00004003, 0x00000002, 0x00004003, 0x00000001, 0x00004004,
+	0x00000002, 0x00004004, 0x00000001, 0x00004005, 0x00000002, 0x00004005, 0x00000001, 0x00004018,
+	0x00000002, 0x00004018, 0x00000001, 0x0000401f, 0x00000002, 0x0000401b, 0x00000001, 0x00004163,
+	0x00000002, 0x00004019, 0x00000001, 0x0000401b, 0x00000002, 0x0000401f, 0x00000001, 0x00004019,
+	0x00000002, 0x00000000, 0x00000001, 0x08001004, 0x00000014, 0x00000000, 0x00000001, 0x00004174,
+	0x00000001, 0x00004012, 0x00000002, 0x00000000, 0x00000001, 0x08001004, 0x00000014, 0x00000000,
+	0x00000001, 0x000040b6, 0x00000001, 0x00004062, 0x00000006, 0x00000000, 0x00000001, 0x08001004,
+	0x00000014, 0x00000000, 0x00000001, 0x00004163, 0x00000001, 0x000040b6, 0x00000002, 0x00000000,
+};
+
+static int __q6apm_map_memory_fixed_region(struct device *dev, unsigned int graph_id,
+					   phys_addr_t phys, size_t sz, bool is_pos_buf);
+
+
+/* Same as __q6apm_map_memory_fixed_region() but with the q6apm handle passed
+ * directly: we are called from the graph open path where the device whose
+ * parent is the APM is not available. */
+static int q6apm_vendor_map_region(struct q6apm *apm, unsigned int graph_id,
+				   phys_addr_t phys, size_t sz)
+{
+	struct audioreach_graph_info *info;
+	struct apm_shared_map_region_payload *mregions;
+	struct apm_cmd_shared_mem_map_regions *cmd;
+	int payload_size = sizeof(*cmd) + sizeof(*mregions);
+	uint32_t buf_sz;
+	struct gpr_pkt *pkt __free(kfree) =
+		audioreach_alloc_apm_cmd_pkt(payload_size,
+					     APM_CMD_SHARED_MEM_MAP_REGIONS, graph_id);
+
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	info = idr_find(&apm->graph_info_idr, graph_id);
+	if (!info) {
+		pr_err("ar-vendor: no info %u\n", graph_id);
+		return -ENODEV;
+	}
+
+	buf_sz = ALIGN(sz, 4096);
+	cmd = (void *)pkt + GPR_HDR_SIZE;
+	cmd->mem_pool_id = APM_MEMORY_MAP_SHMEM8_4K_POOL;
+	cmd->num_regions = 1;
+	cmd->property_flag = 0x0;
+	mregions = (void *)cmd + sizeof(*cmd);
+	mregions->shm_addr_lsw = lower_32_bits(phys);
+	mregions->shm_addr_msw = upper_32_bits(phys);
+	mregions->mem_size_bytes = buf_sz;
+
+	return q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_SHARED_MEM_MAP_REGIONS);
+}
+
+static void *vendor_payload_buf;
+static dma_addr_t vendor_payload_phys;
+
+static struct gpr_pkt *q6apm_vendor_graph_pkt(struct q6apm *apm, unsigned int graph_id)
+{
+	size_t sz = sizeof(vendor_dev_graph_payload);
+	struct audioreach_graph_info *info;
+	struct apm_cmd_header *hdr;
+	struct gpr_pkt *pkt;
+	int ret;
+
+	info = idr_find(&apm->graph_info_idr, graph_id);
+	if (!info) {
+		pr_err("ar-vendor: no graph_info for id %u\n", graph_id);
+		return ERR_PTR(-ENODEV);
+	}
+
+	if (!vendor_payload_buf) {
+		vendor_payload_buf = kzalloc(ALIGN(sz, 4096), GFP_KERNEL);
+		if (!vendor_payload_buf) {
+			pr_err("ar-vendor: kzalloc failed\n");
+			return ERR_PTR(-ENOMEM);
+		}
+		vendor_payload_phys = virt_to_phys(vendor_payload_buf);
+	}
+	memcpy(vendor_payload_buf, vendor_dev_graph_payload, sz);
+
+	ret = __q6apm_map_memory_fixed_region(apm->dev, graph_id,
+					      vendor_payload_phys, sz, false);
+	if (ret < 0) {
+		pr_err("ar-vendor: map regions failed %d\n", ret);
+		return ERR_PTR(ret);
+	}
+
+	pkt = audioreach_alloc_apm_cmd_pkt(0, APM_CMD_GRAPH_OPEN, 0);
+	if (IS_ERR(pkt)) {
+		pr_err("ar-vendor: alloc pkt failed %ld\n", PTR_ERR(pkt));
+		return pkt;
+	}
+
+	hdr = (void *)pkt + GPR_HDR_SIZE;
+	hdr->payload_address_lsw = 0;
+	hdr->payload_address_msw = 0;
+	hdr->mem_map_handle = info->mem_map_handle;
+	hdr->payload_size = sz;
+
+	pr_debug("ar-vendor: OOB graph open, handle 0x%x size %zu\n",
+		info->mem_map_handle, sz);
+	return pkt;
+}
+
 static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, uint32_t graph_id)
 {
 	struct audioreach_graph_info *info;
@@ -54,6 +257,7 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 	}
 
 	info = idr_find(&apm->graph_info_idr, graph_id);
+	pr_debug("ar-debug: graph_open id=%d -> %s\n", graph_id, info ? "found" : "MISSING");
 
 	if (!info)
 		return ERR_PTR(-ENODEV);
@@ -74,6 +278,17 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 		return ERR_CAST(err);
 	}
 
+	if (vendor_replay && graph_id == 40) {
+		kfree(graph->graph);
+		graph->graph = audioreach_alloc_apm_cmd_pkt(0, APM_CMD_GRAPH_OPEN, 0);
+		if (IS_ERR(graph->graph)) {
+			void *err = graph->graph;
+
+			kfree(graph);
+			return ERR_CAST(err);
+		}
+	}
+
 	mutex_lock(&apm->lock);
 	id = idr_alloc(&apm->graph_idr, graph, graph_id, graph_id + 1, GFP_KERNEL);
 	if (id < 0) {
@@ -86,6 +301,33 @@ static struct audioreach_graph *q6apm_get_audioreach_graph(struct q6apm *apm, ui
 	mutex_unlock(&apm->lock);
 
 	kref_init(&graph->refcount);
+
+	if (vendor_replay && graph_id == 40) {
+		struct apm_cmd_header *hdr = (void *)graph->graph + GPR_HDR_SIZE;
+		size_t sz = sizeof(vendor_dev_graph_payload);
+		int mret;
+
+		if (!vendor_payload_buf) {
+			vendor_payload_buf = kzalloc(ALIGN(sz, 4096), GFP_KERNEL);
+			if (!vendor_payload_buf)
+				return ERR_PTR(-ENOMEM);
+			vendor_payload_phys = virt_to_phys(vendor_payload_buf);
+		}
+		memcpy(vendor_payload_buf, vendor_dev_graph_payload, sz);
+
+		mret = q6apm_vendor_map_region(apm, graph_id,
+					       vendor_payload_phys, sz);
+		pr_debug("ar-vendor: map ret %d\n", mret);
+		if (mret < 0)
+			return ERR_PTR(mret);
+
+		hdr->payload_address_lsw = 0;
+		hdr->payload_address_msw = 0;
+		hdr->mem_map_handle = graph->info->mem_map_handle;
+		hdr->payload_size = sz;
+		pr_debug("ar-vendor: OOB graph open handle 0x%x size %zu\n",
+			graph->info->mem_map_handle, sz);
+	}
 
 	q6apm_send_cmd_sync(apm, graph->graph, 0);
 
@@ -142,22 +384,35 @@ static void q6apm_put_audioreach_graph(struct kref *ref)
 
 static int q6apm_get_apm_state(struct q6apm *apm)
 {
-	struct gpr_pkt *pkt __free(kfree) = audioreach_alloc_apm_cmd_pkt(0,
-								APM_CMD_GET_SPF_STATE, 0);
+	struct gpr_pkt *pkt __free(kfree) = NULL;
+	int ret;
+
+	pkt = audioreach_alloc_apm_cmd_pkt(0, APM_CMD_GET_SPF_STATE, 0);
 	if (IS_ERR(pkt))
 		return PTR_ERR(pkt);
 
-	q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
+	ret = q6apm_send_cmd_sync(apm, pkt, APM_CMD_RSP_GET_SPF_STATE);
+	if (ret)
+		return ret;
 
 	return apm->state;
 }
 
 bool q6apm_is_adsp_ready(void)
 {
-	if (g_apm)
-		return q6apm_get_apm_state(g_apm);
+	int state;
 
-	return false;
+	/*
+	 * The GPR receive callback is installed by the APR core only after the
+	 * APM probe has returned.  Sending GET_SPF_STATE before that point can
+	 * never be answered and blocks for the full command timeout, so report
+	 * "not ready" and let the caller defer instead.
+	 */
+	if (!g_apm || !READ_ONCE(g_apm->gdev->svc.callback))
+		return false;
+
+	state = q6apm_get_apm_state(g_apm);
+	return state > 0;
 }
 EXPORT_SYMBOL_GPL(q6apm_is_adsp_ready);
 
@@ -169,9 +424,14 @@ static struct audioreach_module *__q6apm_find_module_by_mid(struct q6apm *apm,
 	struct audioreach_sub_graph *sgs;
 	struct audioreach_module *module;
 
+	pr_debug("ar-debug: find mid=%x info=%d\n", mid, info->id);
 	list_for_each_entry(sgs, &info->sg_list, node) {
 		list_for_each_entry(container, &sgs->container_list, node) {
 			list_for_each_entry(module, &container->modules_list, node) {
+				pr_debug("ar-debug:   cand mid=%x iid=%x cont=%d sg=%d\n",
+					module->module_id, module->instance_id,
+					container->container_id,
+					sgs->sub_graph_id);
 				if (mid == module->module_id)
 					return module;
 			}
@@ -186,6 +446,8 @@ int q6apm_graph_media_format_shmem(struct q6apm_graph *graph,
 {
 	struct audioreach_module *module;
 
+	pr_debug("ar-debug: shmem graph=%d info=%d dir=%d\n",
+		graph->id, graph->info->id, cfg->direction);
 	if (cfg->direction == SNDRV_PCM_STREAM_CAPTURE) {
 		module = q6apm_find_module_by_mid(graph, MODULE_ID_SH_MEM_PUSH_MODE);
 		if (!module)
@@ -440,34 +702,137 @@ int q6apm_set_real_module_id(struct device *dev, struct q6apm_graph *graph,
 }
 EXPORT_SYMBOL_GPL(q6apm_set_real_module_id);
 
-int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_module_config *cfg)
+static bool audioreach_is_shmem_module(uint32_t module_id)
+{
+	return module_id == MODULE_ID_WR_SHARED_MEM_EP ||
+	       module_id == MODULE_ID_RD_SHARED_MEM_EP ||
+	       module_id == MODULE_ID_SH_MEM_PULL_MODE ||
+	       module_id == MODULE_ID_SH_MEM_PUSH_MODE;
+}
+
+static bool audioreach_sg_has_shmem(const struct audioreach_sub_graph *sg)
+{
+	const struct audioreach_container *container;
+	const struct audioreach_module *module;
+
+	list_for_each_entry(container, &sg->container_list, node) {
+		list_for_each_entry(module, &container->modules_list, node) {
+			if (audioreach_is_shmem_module(module->module_id))
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * Configure the modules of one graph with a PCM media format.
+ *
+ * mode 0 (stream): only the sub-graph that carries the shared-memory endpoint,
+ *                  i.e. the front-end stream sub-graph.  A graph that also
+ *                  carries a device sub-graph (the single-graph topology) must
+ *                  not have its TDM/I2S endpoint reconfigured with the
+ *                  front-end's S24 format - the backend owns that endpoint and
+ *                  the stock device runs it as S32_LE.
+ * mode 1 (device): only the sub-graphs without a shared-memory endpoint.
+ * mode 2 (all):    every module, upstream behaviour for a single-sub-graph
+ *                  backend graph.
+ */
+static int audioreach_graph_media_format(struct q6apm_graph *graph,
+					 struct audioreach_module_config *cfg,
+					 int mode)
 {
 	struct audioreach_graph_info *info = graph->info;
 	struct audioreach_sub_graph *sgs;
 	struct audioreach_container *container;
 	struct audioreach_module *module;
+	bool combined = false;
 	int ret;
 
+	if (mode != 2) {
+		list_for_each_entry(sgs, &info->sg_list, node) {
+			if (audioreach_sg_has_shmem(sgs)) {
+				combined = true;
+				break;
+			}
+		}
+		/* A pure device graph has no stream sub-graph to filter on. */
+		if (!combined)
+			mode = 2;
+	}
+
 	list_for_each_entry(sgs, &info->sg_list, node) {
+		bool has_shmem = audioreach_sg_has_shmem(sgs);
+
+		if (mode == 0 && !has_shmem)
+			continue;
+		if (mode == 1 && has_shmem)
+			continue;
+
 		list_for_each_entry(container, &sgs->container_list, node) {
 			list_for_each_entry(module, &container->modules_list, node) {
-				if ((module->module_id == MODULE_ID_WR_SHARED_MEM_EP) ||
-					(module->module_id == MODULE_ID_RD_SHARED_MEM_EP) ||
-					(module->module_id == MODULE_ID_SH_MEM_PULL_MODE) ||
-					(module->module_id == MODULE_ID_SH_MEM_PUSH_MODE))
+				if (audioreach_is_shmem_module(module->module_id))
 					continue;
 
 				ret = audioreach_set_media_format(graph, module, cfg);
-				if (ret)
+				if (ret) {
+					dev_err(graph->dev, "module 0x%08x iid %u media fmt failed: %d\n",
+						module->module_id, module->instance_id, ret);
+					/*
+					 * The data-logging module is a debug tap; a DSP
+					 * that refuses to configure it must not take the
+					 * whole backend down.
+					 */
+					if (module->module_id == MODULE_ID_DATA_LOGGING)
+						continue;
 					return ret;
+				}
 			}
 		}
 	}
 
 	return 0;
+}
 
+int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_module_config *cfg)
+{
+	return audioreach_graph_media_format(graph, cfg, 0);
 }
 EXPORT_SYMBOL_GPL(q6apm_graph_media_format_pcm);
+
+/* Used by a backend DAI that shares its graph with the stream sub-graph. */
+/*
+ * Program the device-side MFC with the speaker slot matrix for the given
+ * screen rotation (0/90/180/270).  Used by the backend DAI both at stream
+ * start and when the rotation changes while the graph is running.
+ */
+int q6apm_graph_set_chmixer(struct q6apm_graph *graph, unsigned int rotation)
+{
+	struct audioreach_graph_info *info = graph->info;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_container *container;
+	struct audioreach_module *module;
+
+	list_for_each_entry(sgs, &info->sg_list, node) {
+		list_for_each_entry(container, &sgs->container_list, node) {
+			list_for_each_entry(module, &container->modules_list, node) {
+				if (module->module_id == MODULE_ID_MFC)
+					return audioreach_mfc_set_chmixer_coeff(graph, module,
+										rotation);
+			}
+		}
+	}
+
+	return -ENOENT;
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_set_chmixer);
+
+int q6apm_graph_media_format_device(struct q6apm_graph *graph,
+				    struct audioreach_module_config *cfg)
+{
+	return audioreach_graph_media_format(graph, cfg, 1);
+}
+EXPORT_SYMBOL_GPL(q6apm_graph_media_format_device);
 
 int q6apm_write_async(struct q6apm_graph *graph, uint32_t len, uint32_t msw_ts,
 		      uint32_t lsw_ts, uint32_t wflags)
@@ -566,7 +931,15 @@ static int graph_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 	phys_addr_t phys;
 	int token;
 
-	result = data->payload;
+		if (dump_gpr_rsp) {
+		const u32 *w = data->payload;
+
+		pr_debug("ar-grsp: op 0x%x token 0x%x %08x %08x %08x %08x %08x %08x\n",
+			hdr->opcode, hdr->token,
+			w[0], w[1], w[2], w[3], w[4], w[5]);
+	}
+
+result = data->payload;
 
 	switch (hdr->opcode) {
 	case APM_EVENT_MODULE_TO_CLIENT:
@@ -806,8 +1179,12 @@ int q6apm_graph_start(struct q6apm_graph *graph)
 
 	if (ar_graph->start_count == 0) {
 		ret = audioreach_graph_mgmt_cmd(ar_graph, APM_CMD_GRAPH_START);
+		pr_debug("ar-graph-start: graph %u ret %d\n", ar_graph->id, ret);
 		if (ret)
 			return ret;
+	} else {
+		pr_debug("ar-graph-start: graph %u already started (count %d)\n",
+			ar_graph->id, ar_graph->start_count);
 	}
 
 	ar_graph->start_count++;
@@ -883,7 +1260,12 @@ static int apm_probe(gpr_device_t *gdev)
 
 	g_apm = apm;
 
-	q6apm_get_apm_state(apm);
+	/*
+	 * Do not query the SPF state here: the GPR receive callback is not
+	 * installed yet, so the command would go unanswered and stall the
+	 * probe for the full command timeout.  q6apm_is_adsp_ready() does the
+	 * query lazily once the callback is live.
+	 */
 
 	ret = snd_soc_register_component(dev, &q6apm_audio_component, NULL, 0);
 	if (ret < 0) {
@@ -913,6 +1295,25 @@ struct audioreach_module *q6apm_find_module_by_mid(struct q6apm_graph *graph, ui
 
 }
 
+int q6apm_get_module_cfg(struct q6apm_graph *graph, u32 iid, u32 param_id)
+{
+	struct apm_module_param_data *pd;
+	struct gpr_pkt *pkt;
+
+	pkt = audioreach_alloc_apm_cmd_pkt(APM_MODULE_PARAM_DATA_SIZE, APM_CMD_GET_CFG, 0);
+	if (IS_ERR(pkt))
+		return PTR_ERR(pkt);
+
+	pd = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+	pd->module_instance_id = iid;
+	pd->param_id = param_id;
+	pd->param_size = 0;
+	pd->error_code = 0;
+
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+}
+EXPORT_SYMBOL_GPL(q6apm_get_module_cfg);
+
 static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 {
 	gpr_device_t *gdev = priv;
@@ -925,6 +1326,14 @@ static int apm_callback(const struct gpr_resp_pkt *data, void *priv, int op)
 	int graph_id, is_pos_buf;
 
 	result = data->payload;
+
+	if (dump_gpr_rsp) {
+		const u32 *w = data->payload;
+
+		pr_debug("ar-rsp: op 0x%x token 0x%x %08x %08x %08x %08x %08x %08x\n",
+			hdr->opcode, hdr->token,
+			w[0], w[1], w[2], w[3], w[4], w[5]);
+	}
 
 	switch (hdr->opcode) {
 	case APM_CMD_RSP_GET_SPF_STATE:

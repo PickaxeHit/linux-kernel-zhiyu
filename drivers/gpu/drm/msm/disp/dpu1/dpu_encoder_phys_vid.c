@@ -134,8 +134,8 @@ static void drm_mode_to_intf_timing_params(
 		 * TODO: replace drm_dsc_get_bpp_int with logic to handle
 		 * fractional part if there is fraction
 		 */
-		timing->width = timing->width * drm_dsc_get_bpp_int(dsc) /
-				(dsc->bits_per_component * 3);
+		timing->width = DIV_ROUND_UP(timing->width * drm_dsc_get_bpp_int(dsc),
+					     dsc->bits_per_component * 3);
 		timing->xres = timing->width;
 		timing->dce_bytes_per_line = msm_dsc_get_bytes_per_line(dsc);
 	}
@@ -495,6 +495,10 @@ skip_flush:
 		"update pending flush ctl %d intf %d\n",
 		ctl->idx - CTL_0, phys_enc->hw_intf->idx);
 
+	pr_debug("[EN] dpu_phys_vid_enable intf=%d master=%d state=%d\n",
+		phys_enc->hw_intf->idx - INTF_0,
+		dpu_encoder_phys_vid_is_master(phys_enc),
+		phys_enc->enable_state);
 	atomic_set(&phys_enc->underrun_cnt, 0);
 
 	/* ctl_flush & timing engine enable will be triggered by framework */
@@ -567,6 +571,22 @@ static void dpu_encoder_phys_vid_prepare_for_kickoff(
 	 * frame, need to check and wait for hw initiated ctl reset completion
 	 */
 	rc = ctl->ops.wait_reset_status(ctl);
+	if (rc) {
+		/*
+		 * The CTL soft reset issued by the disable path can still be
+		 * pending here when MDSS was powered down in between: the
+		 * hardware cannot complete it on its own.  Issue it again and
+		 * give it a second chance instead of giving up -- giving up
+		 * unregisters the vsync callback and the encoder never sees
+		 * another frame-done.
+		 */
+		DPU_DEBUG_VIDENC(phys_enc,
+				"ctl %d reset still pending, re-issuing\n",
+				ctl->idx);
+		ctl->ops.reset(ctl);
+		rc = ctl->ops.wait_reset_status(ctl);
+	}
+
 	if (rc) {
 		DPU_ERROR_VIDENC(phys_enc, "ctl %d reset failure: %d\n",
 				ctl->idx, rc);
@@ -659,6 +679,8 @@ static void dpu_encoder_phys_vid_handle_post_kickoff(
 	 * Video encoders need to turn on their interfaces now
 	 */
 	if (phys_enc->enable_state == DPU_ENC_ENABLING) {
+		pr_debug("[EN] post_kickoff intf=%d enable_timing(1)\n",
+			phys_enc->hw_intf->idx - INTF_0);
 		trace_dpu_enc_phys_vid_post_kickoff(DRMID(phys_enc->parent),
 				    phys_enc->hw_intf->idx - INTF_0);
 		spin_lock_irqsave(phys_enc->enc_spinlock, lock_flags);

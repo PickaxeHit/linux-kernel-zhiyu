@@ -697,7 +697,7 @@ static struct clk_rcg2 disp_cc_mdss_mdp_clk_src = {
 		 * It is not clear whether such approach should be taken instead
 		 * of manual control.
 		 */
-		.ops = &clk_rcg2_shared_ops,
+		.ops = &clk_rcg2_shared_no_init_park_ops,
 	},
 };
 
@@ -1759,7 +1759,8 @@ static struct gdsc mdss_gdsc = {
 		.name = "mdss_gdsc",
 	},
 	.pwrsts = PWRSTS_OFF_ON,
-	.flags = POLL_CFG_GDSCR | HW_CTRL | RETAIN_FF_ENABLE,
+	/* EXPERIMENT: never power-collapse MDSS, only suspend clocks/icc */
+	.flags = POLL_CFG_GDSCR | HW_CTRL | RETAIN_FF_ENABLE | ALWAYS_ON,
 };
 
 static struct gdsc mdss_int2_gdsc = {

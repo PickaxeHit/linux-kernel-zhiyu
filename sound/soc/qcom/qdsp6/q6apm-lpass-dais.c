@@ -182,22 +182,205 @@ static int q6dma_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+/*
+ * Screen rotation for the speaker slot matrix: 0, 90, 180 or 270 degrees.
+ * The four TDM slots are bottom-left, bottom-right, top-left, top-right in the
+ * default landscape orientation, so the device-side MFC has to duplicate the
+ * stereo stream accordingly.  Writing this parameter re-programs the matrix on
+ * a running graph (the vendor DSP accepts the channel mixer coefficients as a
+ * normal SET_CFG, which is what Android's PAL does on rotation changes).
+ */
+static unsigned int spk_rotation;
+static struct q6apm_graph *spk_graphs[4];
+
+static int q6apm_lpass_dai_spk_rotation_set(const char *val,
+					    const struct kernel_param *kp)
+{
+	unsigned int rotation, i;
+	int ret;
+
+	ret = kstrtouint(val, 0, &rotation);
+	if (ret)
+		return ret;
+	if (rotation % 90)
+		return -EINVAL;
+
+	for (i = 0; i < ARRAY_SIZE(spk_graphs); i++) {
+		if (!spk_graphs[i])
+			continue;
+		ret = q6apm_graph_set_chmixer(spk_graphs[i], rotation % 360);
+		if (ret)
+			return ret;
+	}
+
+	spk_rotation = rotation % 360;
+	return 0;
+}
+
+static const struct kernel_param_ops q6apm_lpass_dai_spk_rotation_ops = {
+	.set = q6apm_lpass_dai_spk_rotation_set,
+	.get = param_get_uint,
+};
+module_param_cb(spk_rotation, &q6apm_lpass_dai_spk_rotation_ops, &spk_rotation, 0644);
+MODULE_PARM_DESC(spk_rotation, "speaker slot matrix rotation in degrees (0/90/180/270)");
+
 static void q6apm_lpass_dai_shutdown(struct snd_pcm_substream *substream, struct snd_soc_dai *dai)
 {
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
 	int rc;
 
-	if (dai_data->is_port_started[dai->id]) {
+	if (dai_data->is_port_started[dai->id] && dai_data->graph[dai->id]) {
 		rc = q6apm_graph_stop(dai_data->graph[dai->id]);
 		dai_data->is_port_started[dai->id] = false;
 		if (rc < 0)
 			dev_err(dai->dev, "failed to stop APM port (%d)\n", rc);
 	}
+	dai_data->is_port_started[dai->id] = false;
 
 	if (dai_data->graph[dai->id]) {
 		q6apm_graph_close(dai_data->graph[dai->id]);
+		if (spk_graphs[dai->id % ARRAY_SIZE(spk_graphs)] == dai_data->graph[dai->id])
+			spk_graphs[dai->id % ARRAY_SIZE(spk_graphs)] = NULL;
 		dai_data->graph[dai->id] = NULL;
 	}
+}
+
+static bool skip_graph_start = true;
+module_param(skip_graph_start, bool, 0644);
+
+/*
+ * The vendor AudioReach firmware wants the *stream* sub-graph started before
+ * the *device* sub-graph (Android's PAL does exactly that: graph_start on the
+ * stream handle, then on the device handle).  ALSA's DPCM does it the other
+ * way round, so hold the backend start back by a few milliseconds.
+ */
+/*
+ * be_start_mode: 0 = never start TDM backends explicitly (the DSP starts them
+ * through the cross-graph connection), 1 = open the device graph and start it
+ * 60 ms after the stream graph (Android's order: the device graph is not even
+ * opened until the stream graph is up), 2 = start immediately (upstream),
+ * 3 = single-graph mode: the device sub-graph lives in the frontend graph
+ * (FORCE_DEVICE_GRAPH_ID 0 in the topology), so only push the TDM media
+ * format through that graph; the frontend prepare/start covers the rest.
+ */
+static int be_start_mode = 3;
+module_param(be_start_mode, int, 0644);
+
+/*
+ * Graph-info id used for the backend DAIs.  -1 keeps upstream behaviour (the
+ * DAI index, i.e. the device sub-graph has a graph of its own); 0 lets the
+ * backend configure a device sub-graph that the topology put into the
+ * frontend graph.
+ */
+static int be_graph_id = 0;
+module_param(be_graph_id, int, 0644);
+MODULE_PARM_DESC(be_graph_id, "graph-info id for backend DAIs (-1 = DAI index)");
+
+MODULE_PARM_DESC(be_graph_id, "graph-info id for backend DAIs (-1 = DAI index)");
+
+static int q6apm_lpass_dai_graph_id(struct snd_soc_dai *dai)
+{
+	return be_graph_id >= 0 ? be_graph_id : dai->id;
+}
+
+struct deferred_be_item {
+	struct snd_soc_dai *dai;
+	int stream;
+};
+
+static struct deferred_be_item deferred_be_start[128];
+static DEFINE_SPINLOCK(deferred_be_lock);
+static void deferred_be_start_work(struct work_struct *work);
+static DECLARE_DELAYED_WORK(deferred_be_work, deferred_be_start_work);
+
+/*
+ * Open the device graph, push the configuration the machine driver stored in
+ * module_config[] and start it.  This must happen *after* the stream graph
+ * runs: the cross-graph connection installed by the mixer control only ends up
+ * in the device graph's GRAPH_OPEN payload, and the DSP refuses a graph that
+ * links from a sub-graph which has not been started yet (Android/PAL opens the
+ * device graph only after graph_start of the stream handle).
+ */
+static int q6apm_lpass_dai_bringup(struct snd_soc_dai *dai, int stream, bool start)
+{
+	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
+	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
+	int idx = dai->id;
+	int graph_id = q6apm_lpass_dai_graph_id(dai);
+	struct q6apm_graph *graph;
+	int rc;
+
+	if (!dai_data->graph[idx]) {
+		graph = q6apm_graph_open(dai->dev, NULL, dai->dev, graph_id, stream);
+		if (IS_ERR(graph)) {
+			dev_err(dai->dev, "Failed to open graph (%d)\n", graph_id);
+			return PTR_ERR(graph);
+		}
+		dai_data->graph[idx] = graph;
+	}
+
+	cfg->direction = stream;
+	if (be_graph_id >= 0 && graph_id == be_graph_id && be_graph_id == 0) {
+		/* device sub-graph lives in the front-end graph */
+		rc = q6apm_graph_media_format_device(dai_data->graph[idx], cfg);
+	} else {
+		rc = q6apm_graph_media_format_pcm(dai_data->graph[idx], cfg);
+	}
+	if (rc) {
+		dev_err(dai->dev, "Failed to set media format %d\n", rc);
+		return rc;
+	}
+
+	rc = q6apm_graph_prepare(dai_data->graph[idx]);
+	if (rc) {
+		dev_err(dai->dev, "Failed to prepare Graph %d\n", rc);
+		return rc;
+	}
+
+	if (!start)
+		return 0;
+
+	rc = q6apm_graph_start(dai_data->graph[idx]);
+	if (rc) {
+		dev_err(dai->dev, "Failed to start APM port %d\n", dai->id);
+		return rc;
+	}
+	dai_data->is_port_started[idx] = true;
+
+	return 0;
+}
+
+static void deferred_be_start_work(struct work_struct *work)
+{
+	unsigned long flags;
+	struct deferred_be_item item;
+	struct snd_soc_dai *dai;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(deferred_be_start); i++) {
+		spin_lock_irqsave(&deferred_be_lock, flags);
+		item = deferred_be_start[i];
+		memset(&deferred_be_start[i], 0, sizeof(item));
+		spin_unlock_irqrestore(&deferred_be_lock, flags);
+		dai = item.dai;
+		if (!dai)
+			continue;
+		if (q6apm_lpass_dai_bringup(dai, item.stream, true))
+			pr_err("q6apm: deferred BE bring-up failed for %d\n", i);
+	}
+}
+
+static void deferred_be_schedule(struct snd_soc_dai *dai, int stream, int id)
+{
+	unsigned long flags;
+
+	if (id < 0 || id >= (int)ARRAY_SIZE(deferred_be_start))
+		return;
+	spin_lock_irqsave(&deferred_be_lock, flags);
+	deferred_be_start[id].dai = dai;
+	deferred_be_start[id].stream = stream;
+	spin_unlock_irqrestore(&deferred_be_lock, flags);
+	schedule_delayed_work(&deferred_be_work, msecs_to_jiffies(60));
 }
 
 static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
@@ -211,6 +394,21 @@ static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		if (!dai_data->is_port_started[dai->id]) {
+			if ((be_start_mode == 0 || be_start_mode == 3) &&
+			    dai_data->graph[dai->id] &&
+			    (dai->id >= PRIMARY_TDM_RX_0 && dai->id <= QUINARY_TDM_TX_7)) {
+				dev_dbg(dai->dev, "port %d: left to the DSP graph\n", dai->id);
+				dai_data->is_port_started[dai->id] = true;
+				break;
+			}
+			if (be_start_mode == 1 &&
+			    (dai->id >= PRIMARY_TDM_RX_0 && dai->id <= QUINARY_TDM_TX_7)) {
+				dev_dbg(dai->dev, "port %d: bring-up deferred until the stream graph runs\n",
+					 dai->id);
+				deferred_be_schedule(dai, substream->stream, dai->id);
+				dai_data->is_port_started[dai->id] = true;
+				break;
+			}
 			ret = q6apm_graph_start(dai_data->graph[dai->id]);
 			if (ret < 0)
 				dev_err(dai->dev, "Failed to start APM port %d\n", dai->id);
@@ -231,6 +429,7 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
 	struct q6apm_graph *graph;
 	int graph_id = dai->id;
+	int gid = q6apm_lpass_dai_graph_id(dai);
 	int rc;
 
 	if (dai_data->is_port_started[dai->id]) {
@@ -239,18 +438,70 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 
 	}
 
+	/*
+	 * Single-graph mode (be_start_mode 3): the device sub-graph lives in the
+	 * frontend graph, which the frontend opens and prepares.  Only push the
+	 * TDM media format here - and do it now, so the interface is configured
+	 * before the frontend starts the graph.
+	 */
+	if (be_start_mode == 3 &&
+	    substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+	    dai->id >= PRIMARY_TDM_RX_0 && dai->id <= QUINARY_TDM_TX_7) {
+		if (!dai_data->graph[dai->id]) {
+			graph = q6apm_graph_open(dai->dev, NULL, dai->dev, gid,
+						 substream->stream);
+			if (IS_ERR(graph)) {
+				dev_err(dai->dev, "Failed to open graph (%d)\n", gid);
+				return PTR_ERR(graph);
+			}
+			dai_data->graph[dai->id] = graph;
+		}
+		cfg->direction = substream->stream;
+		rc = q6apm_graph_media_format_device(dai_data->graph[dai->id], cfg);
+		if (rc) {
+			dev_err(dai->dev, "Failed to set media format %d\n", rc);
+			q6apm_graph_close(dai_data->graph[dai->id]);
+			dai_data->graph[dai->id] = NULL;
+			return rc;
+		}
+		rc = q6apm_graph_set_chmixer(dai_data->graph[dai->id], spk_rotation);
+		if (rc)
+			dev_warn(dai->dev, "port %d: speaker matrix failed %d\n",
+				 dai->id, rc);
+		spk_graphs[dai->id % ARRAY_SIZE(spk_graphs)] = dai_data->graph[dai->id];
+		dev_dbg(dai->dev, "port %d: single-graph mode, media format via graph %d\n",
+			 dai->id, gid);
+		return 0;
+	}
+
+	/*
+	 * TDM playback backends: do not open the device graph here.  DPCM
+	 * prepares the backends before it starts the frontend, but the vendor
+	 * DSP only accepts a device graph whose cross-graph source sub-graph is
+	 * already running, so the whole bring-up is postponed to the delayed
+	 * work scheduled from the trigger (see q6apm_lpass_dai_bringup()).
+	 */
+	if (be_start_mode == 1 &&
+	    substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+	    dai_data->graph[dai->id] == NULL &&
+	    dai->id >= PRIMARY_TDM_RX_0 && dai->id <= QUINARY_TDM_TX_7) {
+		dev_dbg(dai->dev, "port %d: graph open deferred until the stream graph runs\n",
+			 dai->id);
+		return 0;
+	}
+
 	/**
 	 * It is recommend to load DSP with source graph first and then sink
 	 * graph, so sequence for playback and capture will be different
 	 */
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK && dai_data->graph[dai->id] == NULL) {
-		graph = q6apm_graph_open(dai->dev, NULL, dai->dev, graph_id, substream->stream);
+		graph = q6apm_graph_open(dai->dev, NULL, dai->dev, gid, substream->stream);
 		if (IS_ERR(graph)) {
-			dev_err(dai->dev, "Failed to open graph (%d)\n", graph_id);
+			dev_err(dai->dev, "Failed to open graph (%d)\n", gid);
 			rc = PTR_ERR(graph);
 			return rc;
 		}
-		dai_data->graph[graph_id] = graph;
+		dai_data->graph[dai->id] = graph;
 	}
 
 	cfg->direction = substream->stream;
@@ -540,6 +791,8 @@ static int q6apm_lpass_dai_dev_probe(struct platform_device *pdev)
 	cfg.q6hdmi_ops = &q6hdmi_ops;
 	cfg.q6tdm_ops = &q6tdm_ops;
 	dais = q6dsp_audio_ports_set_config(dev, &cfg, &num_dais);
+	if (!dais)
+		return -EINVAL;
 
 	return devm_snd_soc_register_component(dev, &q6apm_lpass_dai_component, dais, num_dais);
 }

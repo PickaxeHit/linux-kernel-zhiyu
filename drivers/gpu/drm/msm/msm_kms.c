@@ -339,6 +339,45 @@ err_msm_uninit:
 	return ret;
 }
 
+/*
+ * Event-driven variant: replay from the PM_POST_SUSPEND notification, which
+ * the PM core sends once the whole resume sequence (all device callbacks) has
+ * finished.  That is a real event, not a timer, and it keeps the recovery
+ * inside the kernel -- no dependency on userspace submitting a commit.
+ */
+static bool kms_resume_pm_notifier;
+module_param(kms_resume_pm_notifier, bool, 0644);
+MODULE_PARM_DESC(kms_resume_pm_notifier,
+		 "Replay the display state from the PM_POST_SUSPEND notification");
+
+static struct notifier_block kms_resume_nb;
+static struct drm_device *kms_resume_ddev;
+
+static int msm_kms_resume_notify(struct notifier_block *nb,
+				 unsigned long action, void *data)
+{
+	struct drm_device *ddev = READ_ONCE(kms_resume_ddev);
+
+	if (action != PM_POST_SUSPEND || !ddev)
+		return NOTIFY_DONE;
+
+	pr_debug("[SUSP] PM_POST_SUSPEND -> display state replay\n");
+	drm_mode_config_reset(ddev);
+	drm_mode_config_helper_resume(ddev);
+
+	return NOTIFY_OK;
+}
+
+static void msm_kms_resume_nb_register(struct drm_device *ddev)
+{
+	WRITE_ONCE(kms_resume_ddev, ddev);
+	if (READ_ONCE(kms_resume_nb.notifier_call))
+		return;
+
+	kms_resume_nb.notifier_call = msm_kms_resume_notify;
+	register_pm_notifier(&kms_resume_nb);
+}
+
 int msm_kms_pm_prepare(struct device *dev)
 {
 	struct msm_drm_private *priv = dev_get_drvdata(dev);
@@ -347,7 +386,86 @@ int msm_kms_pm_prepare(struct device *dev)
 	if (!priv || !priv->kms)
 		return 0;
 
+	if (kms_resume_pm_notifier)
+		msm_kms_resume_nb_register(ddev);
+
+	pr_debug("[SUSP] msm_kms_pm_prepare\n");
 	return drm_mode_config_helper_suspend(ddev);
+}
+
+/*
+ * Vendor parity check: on Android the display is already off when the system
+ * suspends, so sde_kms_pm_resume() replays a state whose CRTCs are all
+ * inactive and the display is re-initialised later, by the normal DPMS
+ * enable path when userspace turns the screen on.  Mainline msm instead tears
+ * the display down inside .prepare (the screen is still on at that point) and
+ * re-enables it inside .complete, i.e. while the PM core is still finishing.
+ *
+ * These knobs let that be steered so the two behaviours can be compared
+ * without a rebuild:
+ *   kms_resume_replay=0  leave the display off at resume; the next userspace
+ *                        commit re-enables it through the DPMS path
+ *   kms_resume_delay_ms  defer the replay out of the PM context
+ */
+static bool kms_resume_replay = true;
+module_param(kms_resume_replay, bool, 0644);
+MODULE_PARM_DESC(kms_resume_replay,
+		 "Replay the display state in .complete (0 = leave it to the next commit)");
+
+/*
+ * Replaying the saved display state from inside .complete() wedged the DSI
+ * command path permanently: the first DCS command never completed
+ * (CMD_MODE_ENGINE_BUSY stuck, FIFO never drained), the engine never recovered
+ * even after seconds, and the DPU CTL reset then failed as well.
+ *
+ * The discriminator is not time but the PM transition itself.  Measured with
+ * clean boots, one s2idle cycle each (kms_resume_delay_ms):
+ *
+ *   inline in .complete            fail      (engine stuck, 2 s poll: still busy)
+ *   PM_POST_SUSPEND notifier       fail      (still inside the transition)
+ *   1 jiffy -> kworker             pass      (ran 0.3 ms after "suspend exit")
+ *   2/5/10/15/20/1500 ms           pass
+ *
+ * In the passing runs the work runs from a kworker right after pm_suspend()
+ * returns; the DSI/PHY/PLL programming, the mdss reset and every register read
+ * back identically in both cases, so the replay itself is fine -- it just must
+ * not execute inside the suspend/resume transition.
+ *
+ * Hence the default: queue it on the system workqueue with a one jiffy
+ * deferral, i.e. "next scheduling opportunity after the transition".  The
+ * value is not a tuned settling time; 1 jiffy and 1.5 s behave the same.
+ * kms_resume_replay=0 instead leaves the re-init entirely to the next commit
+ * (what the vendor stack effectively does).
+ */
+static uint kms_resume_delay_ms;
+static bool kms_resume_inline;
+module_param(kms_resume_inline, bool, 0644);
+MODULE_PARM_DESC(kms_resume_inline,
+		 "Replay straight from .complete (known to wedge the DSI; debug only)");
+static uint kms_resume_delay_us;
+module_param(kms_resume_delay_us, uint, 0644);
+MODULE_PARM_DESC(kms_resume_delay_us,
+		 "Extra microsecond deferral inside the replay worker (ordering bisect)");
+module_param(kms_resume_delay_ms, uint, 0644);
+MODULE_PARM_DESC(kms_resume_delay_ms,
+		 "Defer the display state replay by this many ms (0 = inline)");
+
+static struct delayed_work kms_resume_work;
+static bool kms_resume_work_ready;
+
+
+
+static void msm_kms_resume_worker(struct work_struct *work)
+{
+	struct drm_device *ddev = READ_ONCE(kms_resume_ddev);
+
+	if (!ddev)
+		return;
+
+	pr_debug("[SUSP] deferred display state replay\n");
+	if (kms_resume_delay_us)
+		usleep_range(kms_resume_delay_us, kms_resume_delay_us + 50);
+	drm_mode_config_helper_resume(ddev);
 }
 
 void msm_kms_pm_complete(struct device *dev)
@@ -358,6 +476,53 @@ void msm_kms_pm_complete(struct device *dev)
 	if (!priv || !priv->kms)
 		return;
 
+	if (!kms_resume_work_ready) {
+		INIT_DELAYED_WORK(&kms_resume_work, msm_kms_resume_worker);
+		kms_resume_work_ready = true;
+	}
+	cancel_delayed_work_sync(&kms_resume_work);
+
+	if (kms_resume_pm_notifier) {
+		pr_debug("[SUSP] msm_kms_pm_complete: replay via PM notifier\n");
+		return;
+	}
+
+	if (!kms_resume_replay) {
+		pr_debug("[SUSP] msm_kms_pm_complete: display left off\n");
+		return;
+	}
+
+	if (!kms_resume_inline) {
+		WRITE_ONCE(kms_resume_ddev, ddev);
+		/*
+		 * Hand the replay to a worker.  The point is the context, not a
+		 * delay: the same replay wedges the DSI command engine whenever
+		 * it runs in the task that is executing the PM transition
+		 * (a device .complete callback, or a PM notifier), and works
+		 * from a kworker even when that kworker runs *before*
+		 * pm_restore_console().  So no timing constant is needed --
+		 * schedule_work() already guarantees the right context.
+		 */
+		if (kms_resume_delay_ms) {
+			pr_debug("[SUSP] msm_kms_pm_complete: replay deferred %ums\n",
+				kms_resume_delay_ms);
+			schedule_delayed_work(&kms_resume_work,
+					      msecs_to_jiffies(kms_resume_delay_ms));
+		} else {
+			pr_debug("[SUSP] msm_kms_pm_complete: replay queued to worker\n");
+			schedule_work(&kms_resume_work.work);
+		}
+		return;
+	}
+
+	pr_debug("[SUSP] msm_kms_pm_complete -> drm_mode_config_helper_resume\n");
+	/*
+	 * Vendor parity (sde_kms_pm_resume): reset the DRM software state
+	 * before replaying the saved atomic state.  Without it the DPU/encoder
+	 * software state is stale after an MDSS power collapse and the CTL
+	 * software reset never completes.
+	 */
+	drm_mode_config_reset(ddev);
 	drm_mode_config_helper_resume(ddev);
 }
 

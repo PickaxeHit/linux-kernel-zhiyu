@@ -2891,7 +2891,13 @@ static struct gdsc gcc_pcie_0_gdsc = {
 		.name = "gcc_pcie_0_gdsc",
 	},
 	.pwrsts = PWRSTS_OFF_ON,
-	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+	/*
+	 * Keep the PCIe 0 power domain powered: with a WCN endpoint present the
+	 * domain is switched off by genpd during system suspend and its enable in
+	 * the resume noirq phase times out ("status stuck at 'off'"), leaving the
+	 * whole PCIe block dead; the next access then wedges the bus (hard reset).
+	 */
+	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE | ALWAYS_ON,
 };
 
 static struct gdsc gcc_pcie_0_phy_gdsc = {
@@ -2905,7 +2911,13 @@ static struct gdsc gcc_pcie_0_phy_gdsc = {
 		.name = "gcc_pcie_0_phy_gdsc",
 	},
 	.pwrsts = PWRSTS_OFF_ON,
-	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE,
+	/*
+	 * Same reasoning as gcc_pcie_0_gdsc: the QMP PHY provides the PCIe
+	 * reference clock to the endpoint.  If this domain is collapsed during
+	 * system suspend the endpoint loses refclk, drops off the link and its
+	 * config space stops responding after resume.
+	 */
+	.flags = POLL_CFG_GDSCR | RETAIN_FF_ENABLE | VOTABLE | ALWAYS_ON,
 };
 
 static struct gdsc gcc_ufs_mem_phy_gdsc = {

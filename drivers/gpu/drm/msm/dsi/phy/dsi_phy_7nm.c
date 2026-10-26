@@ -83,6 +83,28 @@ struct dsi_pll_7nm {
 	struct msm_dsi_phy *phy;
 
 	u64 vco_current_rate;
+	bool vco_rate_valid;
+
+	/*
+	 * Undocumented analog/lane tuning of the PHY (0x400..0x9ff).  The
+	 * bootloader programs these and the mainline driver never touches
+	 * them; they are lost when the PHY is really powered down (system
+	 * suspend), which leaves the LP/HS lane path broken and makes every
+	 * DCS command time out.  Snapshot them on disable and write them back
+	 * on enable.
+	 *
+	 * NOTE: the save runs in phy_disable(), which is *after* the PLL has
+	 * been powered down, so what gets captured is the powered-down analog
+	 * state, not the state that was in use while the link worked.  Replaying
+	 * that at the end of phy_enable() clobbers the TX analog settings that
+	 * were just programmed.  Kept behind a knob (default off) so the
+	 * "first DCS command after re-init times out" failure can be A/B tested
+	 * on a single build.
+	 */
+#define DSI_7NM_ANALOG_OFF	0x400
+#define DSI_7NM_ANALOG_LEN	0x600
+	u32 saved_analog[DSI_7NM_ANALOG_LEN / 4];
+	bool analog_saved;
 
 	/* protects REG_DSI_7nm_PHY_CMN_CLK_CFG0 register */
 	spinlock_t postdiv_lock;
@@ -103,6 +125,9 @@ struct dsi_pll_7nm {
 };
 
 #define to_pll_7nm(x)	container_of(x, struct dsi_pll_7nm, clk_hw)
+
+static void dsi_7nm_save_analog(struct msm_dsi_phy *phy);
+static void dsi_7nm_restore_analog(struct msm_dsi_phy *phy);
 
 /*
  * Global list of private DSI PLL struct pointers. We need this for bonded DSI
@@ -368,6 +393,7 @@ static int dsi_pll_7nm_vco_set_rate(struct clk_hw *hw, unsigned long rate,
 
 	dsi_pll_ssc_commit(pll_7nm, &config);
 
+	pll_7nm->vco_rate_valid = true;
 	dsi_pll_disable_pll_bias(pll_7nm);
 	/* flush, ensure all register writes are done*/
 	wmb();
@@ -496,6 +522,26 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 	struct dsi_pll_7nm *pll_7nm = to_pll_7nm(hw);
 	int rc;
 
+	/*
+	 * Orphan clock adoption can reach us before the DSI host has enabled
+	 * the PHY. Register access/PLL startup requires the digital top, and
+	 * the minimum-rate fallback alone does not configure the hardware.
+	 * Leave the consumer orphaned until the normal PHY enable/restore
+	 * and host reparent sequence can supply a usable clock.
+	 */
+	pr_debug("[PLL] pll%d vco_prepare enter: rate_valid=%d cmn_ctrl0=%#x pll_on=%d\n",
+		pll_7nm->phy->id, pll_7nm->vco_rate_valid,
+		readl(pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0),
+		pll_7nm->phy->pll_on);
+
+	if (!pll_7nm->vco_rate_valid ||
+	    !(readl(pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_CTRL_0) &
+	      DSI_7nm_PHY_CMN_CTRL_0_DIGTOP_PWRDN_B)) {
+		pr_debug("[PLL] pll%d vco_prepare -> -EAGAIN (digtop down or no rate)\n",
+			pll_7nm->phy->id);
+		return -EAGAIN;
+	}
+
 	dsi_pll_enable_pll_bias(pll_7nm);
 	if (pll_7nm->slave)
 		dsi_pll_enable_pll_bias(pll_7nm->slave);
@@ -511,6 +557,7 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 
 	/* Check for PLL lock */
 	rc = dsi_pll_7nm_lock_status(pll_7nm);
+	pr_debug("[PLL] pll%d lock rc=%d\n", pll_7nm->phy->id, rc);
 	if (rc) {
 		pr_err("PLL(%d) lock failed\n", pll_7nm->phy->id);
 		goto error;
@@ -535,7 +582,15 @@ static int dsi_pll_7nm_vco_prepare(struct clk_hw *hw)
 	if (pll_7nm->slave)
 		writel(0x1, pll_7nm->slave->phy->base + REG_DSI_7nm_PHY_CMN_RBUF_CTRL);
 
+	return 0;
+
 error:
+	/* CCF does not call unprepare after a failed prepare. */
+	writel(0, pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
+	if (pll_7nm->slave)
+		dsi_pll_disable_pll_bias(pll_7nm->slave);
+	dsi_pll_disable_pll_bias(pll_7nm);
+	wmb();
 	return rc;
 }
 
@@ -554,6 +609,7 @@ static void dsi_pll_7nm_vco_unprepare(struct clk_hw *hw)
 	 * make sure to gate the clock using the clock enable bit before
 	 * powering down the PLL
 	 */
+	pr_debug("[PLL] pll%d vco_unprepare\n", pll_7nm->phy->id);
 	dsi_pll_disable_global_clk(pll_7nm);
 	writel(0, pll_7nm->phy->base + REG_DSI_7nm_PHY_CMN_PLL_CNTRL);
 	dsi_pll_disable_sub(pll_7nm);
@@ -599,6 +655,7 @@ static unsigned long dsi_pll_7nm_vco_recalc_rate(struct clk_hw *hw,
 
 	vco_rate = pll_freq;
 	pll_7nm->vco_current_rate = vco_rate;
+	pll_7nm->vco_rate_valid = vco_rate != 0;
 
 	DBG("DSI PLL%d returning vco rate = %lu, dec = %x, frac = %x",
 	    pll_7nm->phy->id, (unsigned long)vco_rate, dec, frac);
@@ -673,6 +730,9 @@ static int dsi_7nm_pll_restore_state(struct msm_dsi_phy *phy)
 				   DSI_7nm_PHY_CMN_CLK_CFG0_DIV_CTRL_7_4(cached->pix_clk_div));
 	dsi_pll_cmn_clk_cfg1_update(pll_7nm, DSI_7nm_PHY_CMN_CLK_CFG1_DSICLK_SEL__MASK,
 				    cached->pll_mux);
+
+	if (phy->usecase == MSM_DSI_PHY_SLAVE)
+		return 0;
 
 	ret = dsi_pll_7nm_vco_set_rate(phy->vco_hw,
 			pll_7nm->vco_current_rate,
@@ -886,11 +946,14 @@ static int dsi_pll_7nm_init(struct msm_dsi_phy *phy)
 
 	phy->vco_hw = &pll_7nm->clk_hw;
 
-	/* TODO: Remove this when we have proper display handover support */
-	msm_dsi_phy_pll_save_state(phy);
 	/*
-	 * Store also proper vco_current_rate, because its value will be used in
-	 * dsi_7nm_pll_restore_state().
+	 * Do not save the PLL state here: at probe the PHY is not configured
+	 * yet, so the cached values are the reset defaults (e.g. a pixel clock
+	 * divider of 15 instead of 5).  The state is saved when the PHY is
+	 * disabled (dsi_mgr_bridge_post_disable) and restored on the next
+	 * enable; restoring the probe-time defaults corrupts the picture.
+	 *
+	 * Store the vco_current_rate below so that restore has a valid value.
 	 */
 	if (!dsi_pll_7nm_vco_recalc_rate(&pll_7nm->clk_hw, VCO_REF_CLK_RATE))
 		pll_7nm->vco_current_rate = pll_7nm->phy->cfg->min_pll_rate;
@@ -960,6 +1023,7 @@ static void dsi_phy_hw_v4_0_lane_settings(struct msm_dsi_phy *phy)
 static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 			      struct msm_dsi_phy_clk_request *clk_req)
 {
+	pr_debug("[PLL] phy%d enable (usecase=%d)\n", phy->id, phy->usecase);
 	int ret;
 	u32 status;
 	u32 const delay_us = 5;
@@ -1187,6 +1251,22 @@ static int dsi_7nm_phy_enable(struct msm_dsi_phy *phy,
 	/* DSI lane settings */
 	dsi_phy_hw_v4_0_lane_settings(phy);
 
+	/*
+	 * Replay the analog/lane tuning captured the last time this PHY was
+	 * fully programmed (see below), then refresh the snapshot.
+	 *
+	 * The snapshot used to be taken in phy_disable(), i.e. after the PLL
+	 * had already been powered down, so it held the powered-down analog
+	 * state and replaying it broke the link.  Capturing at the end of a
+	 * successful enable instead records the state that actually works, and
+	 * boot is the important case: the first enable runs with the
+	 * bootloader's tuning already in the registers, so that is what gets
+	 * replayed after a real power loss (s2idle suspends MMCX, which resets
+	 * the PHY block).
+	 */
+	dsi_7nm_restore_analog(phy);
+	dsi_7nm_save_analog(phy);
+
 	DBG("DSI%d PHY enabled", phy->id);
 
 	return 0;
@@ -1207,8 +1287,54 @@ static bool dsi_7nm_set_continuous_clock(struct msm_dsi_phy *phy, bool enable)
 	return enable;
 }
 
+/*
+ * NOTE: this range (phy_base + 0x400..0x9ff) overlaps the PLL register block
+ * (pll_base = phy_base + 0x200, so +0x400 is PLL +0x200), so replaying it also
+ * rewrites PLL configuration after the PHY was programmed but before the PLL
+ * locks.  With the snapshot captured at the end of phy_enable() that breaks a
+ * plain DPMS re-init, and it does not fix the s2idle failure either, so it
+ * stays off.
+ */
+static bool dsi_analog_restore;
+module_param(dsi_analog_restore, bool, 0644);
+MODULE_PARM_DESC(dsi_analog_restore,
+		 "Replay the DSI PHY TX analog block (0x400..0x9ff) captured at the end of the previous enable");
+
+static void dsi_7nm_save_analog(struct msm_dsi_phy *phy)
+{
+	struct dsi_pll_7nm *pll = phy->pll_data;
+	int i;
+
+	if (!pll || !dsi_analog_restore) {
+		if (pll)
+			pll->analog_saved = false;
+		return;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(pll->saved_analog); i++)
+		pll->saved_analog[i] = readl(phy->base + DSI_7NM_ANALOG_OFF + i * 4);
+	pll->analog_saved = true;
+	pr_debug("[PHY] phy%d analog state saved (0x%x regs)\n", phy->id,
+		DSI_7NM_ANALOG_LEN / 4);
+}
+
+static void dsi_7nm_restore_analog(struct msm_dsi_phy *phy)
+{
+	struct dsi_pll_7nm *pll = phy->pll_data;
+	int i;
+
+	if (!pll || !pll->analog_saved || !dsi_analog_restore)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(pll->saved_analog); i++)
+		writel(pll->saved_analog[i], phy->base + DSI_7NM_ANALOG_OFF + i * 4);
+	wmb();
+	pr_debug("[PHY] phy%d analog state restored\n", phy->id);
+}
+
 static void dsi_7nm_phy_disable(struct msm_dsi_phy *phy)
 {
+	pr_debug("[PLL] phy%d disable\n", phy->id);
 	struct dsi_pll_7nm *pll = phy->pll_data;
 	void __iomem *base = phy->base;
 	unsigned long flags;

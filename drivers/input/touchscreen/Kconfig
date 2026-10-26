@@ -1415,3 +1415,26 @@ config TOUCHSCREEN_HIMAX_HX83112B
 	  module will be called himax_hx83112b.
 
 endif
+
+config TOUCHSCREEN_NT36526E_THP_KUNIT_TEST
+	bool "NT36526E firmware tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && TOUCHSCREEN_NT36526E_THP=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test parsing and host download with a simulated register bus.
+	  The optional nt36526e/piano-test.bin fixture is user-supplied.
+
+config TOUCHSCREEN_NT36526E_THP
+	tristate "Novatek NT36526E host-processed touch transport"
+	depends on SPI
+	depends on DRM || !DRM
+	select REGMAP
+	select FW_LOADER
+	help
+	  Raw THP transport for the NT36526E cascade configuration. A separate
+	  userspace processor is required to report touch coordinates. Firmware
+	  download and capture begin when its exclusive read-only misc device
+	  is opened. With a panel phandle, capture follows the shared TDDI
+	  panel enable sequence and reloads firmware after panel enable.
+
+	  If unsure, say N.
