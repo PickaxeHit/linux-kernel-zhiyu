@@ -1430,6 +1430,7 @@ config TOUCHSCREEN_NT36526E_THP
 	depends on DRM || !DRM
 	select REGMAP
 	select FW_LOADER
+	select POWER_SUPPLY
 	help
 	  Raw THP transport for the NT36526E cascade configuration. A separate
 	  userspace processor is required to report touch coordinates. Firmware

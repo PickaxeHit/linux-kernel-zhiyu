@@ -19,6 +19,7 @@
 #include <linux/of.h>
 #include <linux/poll.h>
 #include <linux/pm.h>
+#include <linux/power_supply.h>
 #include <linux/property.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
@@ -83,6 +84,10 @@ struct nvt_thp {
 	struct regmap *map;
 	struct input_dev *input;
 	struct input_dev *pen_input;
+	struct power_supply *pen_battery;
+	u8 pen_battery_level;
+	bool pen_battery_valid;
+	u8 pen_battery_status;
 	bool pen_down;
 	struct miscdevice misc;
 	struct drm_panel_follower follower;
@@ -242,6 +247,85 @@ static bool nvt_valid_frame(const u8 *payload, size_t size)
 	return !(sum & 0xffff);
 }
 
+static enum power_supply_property nvt_pen_battery_props[] = {
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_SCOPE,
+	POWER_SUPPLY_PROP_MODEL_NAME,
+	POWER_SUPPLY_PROP_MANUFACTURER,
+};
+
+static int nvt_pen_battery_get_property(struct power_supply *psy,
+					enum power_supply_property psp,
+					union power_supply_propval *val)
+{
+	struct nvt_thp *nvt = power_supply_get_drvdata(psy);
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_PRESENT:
+		val->intval = nvt->pen_battery_valid;
+		break;
+	case POWER_SUPPLY_PROP_STATUS:
+		val->intval = nvt->pen_battery_valid ?
+			nvt->pen_battery_status : POWER_SUPPLY_STATUS_UNKNOWN;
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+		val->intval = nvt->pen_battery_valid ? nvt->pen_battery_level : 0;
+		break;
+	case POWER_SUPPLY_PROP_SCOPE:
+		val->intval = POWER_SUPPLY_SCOPE_DEVICE;
+		break;
+	case POWER_SUPPLY_PROP_MODEL_NAME:
+		val->strval = "NVT Pen";
+		break;
+	case POWER_SUPPLY_PROP_MANUFACTURER:
+		val->strval = "Novatek";
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static const struct power_supply_desc nvt_pen_battery_desc = {
+	.name = "nvt-pen-battery",
+	.type = POWER_SUPPLY_TYPE_BATTERY,
+	.properties = nvt_pen_battery_props,
+	.num_properties = ARRAY_SIZE(nvt_pen_battery_props),
+	.get_property = nvt_pen_battery_get_property,
+};
+
+static void nvt_pen_battery_update(struct nvt_thp *nvt, u8 level)
+{
+	bool changed;
+
+	/* 0xff/255 is the "no battery data" value in the pen report. */
+	if (level > 100)
+		return;
+
+	changed = !nvt->pen_battery_valid ||
+		  level != nvt->pen_battery_level;
+
+	if (!nvt->pen_battery_valid) {
+		nvt->pen_battery_status = POWER_SUPPLY_STATUS_UNKNOWN;
+	} else if (level > nvt->pen_battery_level) {
+		/* The pen report has no charge-status bit; infer from level. */
+		changed |= nvt->pen_battery_status != POWER_SUPPLY_STATUS_CHARGING;
+		nvt->pen_battery_status = POWER_SUPPLY_STATUS_CHARGING;
+	} else if (level < nvt->pen_battery_level) {
+		changed |= nvt->pen_battery_status != POWER_SUPPLY_STATUS_DISCHARGING;
+		nvt->pen_battery_status = POWER_SUPPLY_STATUS_DISCHARGING;
+	}
+
+	nvt->pen_battery_valid = true;
+	nvt->pen_battery_level = level;
+
+	if (changed && nvt->pen_battery)
+		power_supply_changed(nvt->pen_battery);
+}
+
 /*
  * Pen report, reverse engineered from nvt_ts_work_func() in the vendor module
  * (stock-fw/nvt_36xxx.ko, disassembly at nvt_ts_work_func+0x914..0xd6c).
@@ -307,6 +391,8 @@ static void nvt_report_pen(struct nvt_thp *nvt, const u8 *rep)
 	distance = (rep[74] << 8) | rep[75];
 	if (x >= 21901 || y >= 35041)
 		return;
+
+	nvt_pen_battery_update(nvt, rep[77]);
 
 	switch (rot) {
 	case 0:  sx = y;             sy = x;             break;
@@ -954,6 +1040,19 @@ static int nvt_probe(struct spi_device *spi)
 	ret = input_register_device(nvt->pen_input);
 	if (ret)
 		return ret;
+
+	{
+		struct power_supply_config psy_cfg = { .drv_data = nvt };
+
+		nvt->pen_battery = devm_power_supply_register(&spi->dev,
+							      &nvt_pen_battery_desc,
+							      &psy_cfg);
+		if (IS_ERR(nvt->pen_battery)) {
+			dev_warn(&spi->dev, "failed to register pen battery: %ld\n",
+				 PTR_ERR(nvt->pen_battery));
+			nvt->pen_battery = NULL;
+		}
+	}
 	/*
 	 * The firmware was booted above, so apply the restore sequence now too.
 	 * Otherwise a boot that never goes through a panel cycle keeps the
