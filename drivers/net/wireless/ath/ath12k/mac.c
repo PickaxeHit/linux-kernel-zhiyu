@@ -1044,6 +1044,24 @@ static void ath12k_pdev_caps_update(struct ath12k *ar)
 	ar->txpower_scale = WMI_HOST_TP_SCALE_MAX;
 }
 
+/* Encode a TXPOWER_LIMIT2G/5G value. Hardware that declares the vendor host
+ * driver's platform limit gets the lower of the two, sent with the SAR reason
+ * as that driver does, so that a later write cannot lift the platform limit
+ * whichever reason the firmware keeps.
+ */
+static u32 ath12k_mac_txpower_limit_param(struct ath12k *ar, u32 txpower)
+{
+	u8 limit = ar->ab->hw_params->pdev_txpower_sar_limit;
+
+	if (!limit)
+		return txpower;
+
+	return u32_encode_bits(min_t(u32, txpower, limit),
+			       WMI_PDEV_PARAM_TXPOWER_VALUE) |
+	       u32_encode_bits(WMI_PDEV_PARAM_TXPOWER_REASON_SAR,
+			       WMI_PDEV_PARAM_TXPOWER_REASON);
+}
+
 static int ath12k_mac_txpower_recalc(struct ath12k *ar)
 {
 	struct ath12k_pdev *pdev = ar->pdev;
@@ -1073,6 +1091,8 @@ static int ath12k_mac_txpower_recalc(struct ath12k *ar)
 	ath12k_dbg(ar->ab, ATH12K_DBG_MAC, "txpower to set in hw %d\n",
 		   txpower / 2);
 
+	txpower = ath12k_mac_txpower_limit_param(ar, txpower);
+
 	if ((pdev->cap.supported_bands & WMI_HOST_WLAN_2GHZ_CAP) &&
 	    ar->txpower_limit_2g != txpower) {
 		param = WMI_PDEV_PARAM_TXPOWER_LIMIT2G;
@@ -1096,8 +1116,8 @@ static int ath12k_mac_txpower_recalc(struct ath12k *ar)
 	return 0;
 
 fail:
-	ath12k_warn(ar->ab, "failed to recalc txpower limit %d using pdev param %d: %d\n",
-		    txpower / 2, param, ret);
+	ath12k_warn(ar->ab, "failed to recalc txpower limit 0x%x using pdev param %d: %d\n",
+		    txpower, param, ret);
 	return ret;
 }
 
@@ -5761,6 +5781,11 @@ int ath12k_mac_op_hw_scan(struct ieee80211_hw *hw,
 	int i, j, ret = 0;
 
 	lockdep_assert_wiphy(hw->wiphy);
+
+	for_each_ar(ah, ar, i) {
+		if (test_bit(ATH12K_FLAG_RECOVERY, &ar->ab->dev_flags))
+			return -EBUSY;
+	}
 
 	chan_list = kzalloc_objs(*chan_list, hw_req->req.n_channels);
 	if (!chan_list)
@@ -14766,6 +14791,30 @@ static int ath12k_mac_setup_register(struct ath12k *ar,
 	return 0;
 }
 
+/* Some devices have no usable address in their OTP and report an all-zero
+ * one in WMI_READY; the platform then provides it through system firmware,
+ * e.g. the devicetree node of the PCI function. If it does not, use a random
+ * address so that the interface can still be brought up.
+ */
+static void ath12k_mac_get_fw_mac_addr(struct ath12k_base *ab)
+{
+	u8 mac_addr[ETH_ALEN] = {};
+
+	if (is_valid_ether_addr(ab->mac_addr))
+		return;
+
+	if (device_get_mac_address(ab->dev, mac_addr) ||
+	    !is_valid_ether_addr(mac_addr)) {
+		ath12k_warn(ab, "no valid MAC address from device or system firmware, using a random one\n");
+		eth_random_addr(ab->mac_addr);
+		return;
+	}
+
+	ath12k_dbg(ab, ATH12K_DBG_BOOT, "using mac address %pM from system firmware\n",
+		   mac_addr);
+	ether_addr_copy(ab->mac_addr, mac_addr);
+}
+
 static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 {
 	struct ieee80211_hw *hw = ah->hw;
@@ -14800,6 +14849,7 @@ static int ath12k_mac_hw_register(struct ath12k_hw *ah)
 		if (ar->ab->pdevs_macaddr_valid) {
 			ether_addr_copy(ar->mac_addr, pdev->mac_addr);
 		} else {
+			ath12k_mac_get_fw_mac_addr(ar->ab);
 			ether_addr_copy(ar->mac_addr, ar->ab->mac_addr);
 			ar->mac_addr[4] += ar->pdev_idx;
 		}

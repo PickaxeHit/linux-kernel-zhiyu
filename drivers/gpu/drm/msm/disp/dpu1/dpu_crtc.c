@@ -1190,6 +1190,7 @@ static void dpu_crtc_atomic_print_state(struct drm_printer *p,
 static void dpu_crtc_disable(struct drm_crtc *crtc,
 			     struct drm_atomic_commit *state)
 {
+
 	struct drm_crtc_state *old_crtc_state = drm_atomic_get_old_crtc_state(state,
 									      crtc);
 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
@@ -1269,6 +1270,7 @@ static void dpu_crtc_disable(struct drm_crtc *crtc,
 static void dpu_crtc_enable(struct drm_crtc *crtc,
 		struct drm_atomic_commit *state)
 {
+
 	struct dpu_crtc *dpu_crtc = to_dpu_crtc(crtc);
 	struct drm_encoder *encoder;
 	bool request_bandwidth = false;
@@ -1530,6 +1532,18 @@ static int dpu_crtc_atomic_check(struct drm_crtc *crtc,
 	const struct drm_plane_state *pstate;
 	struct drm_plane *plane;
 
+	/*
+	 * Turning the screen off detaches the connector from the CRTC, but DRM
+	 * leaves such a CRTC active.  The DPU/DSI runtime PM references then
+	 * keep MDSS powered across the blank, and this panel's bonded DSI link
+	 * stays stalled until MDSS collapses.  Disable the CRTC once its last
+	 * connector is gone so the pipeline is torn down and MDSS can suspend.
+	 */
+	if (crtc_state->active && !crtc_state->connector_mask) {
+		crtc_state->active = false;
+		crtc_state->mode_changed = true;
+	}
+
 	int rc = 0;
 
 	bool needs_dirtyfb = dpu_crtc_needs_dirtyfb(crtc_state);
@@ -1609,8 +1623,20 @@ static enum drm_mode_status dpu_crtc_mode_valid(struct drm_crtc *crtc,
 	    mode->hdisplay > dpu_kms->catalog->caps->max_mixer_width)
 		return MODE_BAD_HVALUE;
 
-	adjusted_mode_clk = dpu_core_perf_adjusted_mode_clk(mode->clock,
-							    dpu_kms->perf.perf_cfg);
+	/*
+	 * Check the same rate the core clock is voted for: the mixers only
+	 * process the active pixels of each line, so the horizontal blanking
+	 * in mode->clock does not load them.
+	 */
+	/*
+	 * Keep 144 Hz selectable: the panel's dfps table runs it at 572.7 MHz,
+	 * which the stock kernel voted as 575 MHz (the MDP clock maximum).  The
+	 * upstream 5% inefficiency margin turns that into 601 MHz and prunes the
+	 * mode; the vote is clamped to max_core_clk_rate either way.
+	 */
+	adjusted_mode_clk =
+		div_u64((u64)mode->vtotal * mode->hdisplay *
+			drm_mode_vrefresh(mode), 1000);
 
 	if (dpu_kms->catalog->caps->has_3d_merge)
 		adjusted_mode_clk /= 2;

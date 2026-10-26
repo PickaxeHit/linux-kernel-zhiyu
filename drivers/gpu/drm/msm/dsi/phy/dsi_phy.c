@@ -773,16 +773,20 @@ int msm_dsi_phy_enable(struct msm_dsi_phy *phy,
 	 * Resetting DSI PHY silently changes its PLL registers to reset status,
 	 * which will confuse clock driver and result in wrong output rate of
 	 * link clocks. Restore PLL status if its PLL is being used as clock
-	 * source.
+	 * source.  The slave link needs this too: its post-dividers are reset
+	 * with the PHY and are needed for its byte/pixel clocks.
 	 */
-	if (phy->usecase != MSM_DSI_PHY_SLAVE) {
-		ret = msm_dsi_phy_pll_restore_state(phy);
-		if (ret) {
-			DRM_DEV_ERROR(dev, "%s: failed to restore phy state, %d\n",
-				__func__, ret);
-			goto pll_restor_fail;
-		}
+	ret = msm_dsi_phy_pll_restore_state(phy);
+	if (ret) {
+		DRM_DEV_ERROR(dev, "%s: failed to restore phy state, %d\n",
+			__func__, ret);
+		goto pll_restor_fail;
 	}
+
+	pr_debug("[PHY] dsi_phy%d enabled usecase=%d cfg0=%#x cfg1=%#x pll_cntrl=%#x pll_status=%#x\n",
+		phy->id, phy->usecase,
+		readl(phy->base + 0x10), readl(phy->base + 0x14),
+		readl(phy->base + 0x3c), readl(phy->base + 0x58));
 
 	return 0;
 
@@ -836,6 +840,8 @@ int msm_dsi_phy_pll_restore_state(struct msm_dsi_phy *phy)
 {
 	int ret;
 
+	pr_debug("[EN] phy_pll_restore id=%d saved=%d usecase=%d\n", phy->id,
+		phy->state_saved, phy->usecase);
 	if (phy->cfg->ops.restore_pll_state && phy->state_saved) {
 		ret = phy->cfg->ops.restore_pll_state(phy);
 		if (ret)

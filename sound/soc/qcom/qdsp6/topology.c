@@ -49,6 +49,7 @@ static struct audioreach_graph_info *audioreach_tplg_alloc_graph_info(struct q6a
 	INIT_LIST_HEAD(&info->sg_list);
 
 	mutex_lock(&apm->lock);
+	pr_debug("ar-debug: creating graph_info id=%d\n", graph_id);
 	ret = idr_alloc_u32(&apm->graph_info_idr, info, &graph_id, graph_id, GFP_KERNEL);
 	mutex_unlock(&apm->lock);
 
@@ -69,6 +70,7 @@ static void audioreach_tplg_add_sub_graph(struct audioreach_sub_graph *sg,
 	list_add_tail(&sg->node, &info->sg_list);
 	sg->info = info;
 	info->num_sub_graphs++;
+	pr_debug("ar-debug: add sg id=%d to info id=%d\n", sg->sub_graph_id, info->id);
 }
 
 static struct audioreach_sub_graph *audioreach_tplg_alloc_sub_graph(struct q6apm *apm,
@@ -155,6 +157,8 @@ static struct audioreach_container *audioreach_tplg_alloc_container(struct q6apm
 	/* add to container list */
 	list_add_tail(&cont->node, &sg->container_list);
 	sg->num_containers++;
+	pr_debug("ar-debug: alloc cont id=%d sg=%d found=%d\n",
+		container_id, sg->sub_graph_id, *found);
 
 	return cont;
 }
@@ -202,6 +206,8 @@ static struct audioreach_module *audioreach_tplg_alloc_module(struct q6apm *apm,
 	mod->container = cont;
 	mod->widget = w;
 	cont->num_modules++;
+	pr_debug("ar-debug: alloc mod iid=%x cont=%d sg=%d\n",
+		module_id, cont->container_id, cont->sub_graph->sub_graph_id);
 
 	return mod;
 }
@@ -457,8 +463,11 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
 	mod_array = audioreach_get_module_array(private);
 	mod_elem = mod_array->value;
 	max_tokens = le32_to_cpu(mod_array->num_elems);
+	pr_debug("ar-debug: widget %s tokens=%d\n", w->name, max_tokens);
 	while (tkn_count <= (max_tokens - 1)) {
 		token = le32_to_cpu(mod_elem->token);
+		pr_debug("ar-debug:   token=%u val=%u\n", token,
+			le32_to_cpu(mod_elem->value));
 		switch (token) {
 		/* common module info */
 		case AR_TKN_U32_MODULE_ID:
@@ -570,6 +579,10 @@ static struct audioreach_module *audioreach_parse_common_tokens(struct q6apm *ap
 		int pn, id = 0;
 
 		mod->module_id = module_id;
+		pr_debug("ar-debug: mod %s mid=%x iid=%x cont=%d sg=%d\n",
+			w->name, module_id, mod->instance_id,
+			mod->container->container_id,
+			mod->container->sub_graph->sub_graph_id);
 		mod->max_ip_port = max_ip_port;
 		mod->max_op_port = max_op_port;
 		mod->src_mod_inst_id = src_mod_inst_id;
@@ -806,6 +819,62 @@ static int audioreach_widget_load_buffer(struct snd_soc_component *component,
 	case MODULE_ID_I2S_SOURCE:
 		audioreach_widget_i2s_module_load(mod, mod_array);
 		break;
+	case MODULE_ID_TDM_SINK:
+		/*
+		 * The TDM endpoint shares the I2S interface tokens (hw-if idx,
+		 * type, format data) and adds tokens 262..269 for the frame
+		 * layout, exactly as Linux-MSM's audioreach/tokens.m4 defines
+		 * them.  The vendor tplg on this board carries the real values,
+		 * so read them instead of guessing.
+		 */
+		audioreach_widget_i2s_module_load(mod, mod_array);
+		{
+			const struct snd_soc_tplg_vendor_value_elem *e = mod_array->value;
+			int n = 0;
+			u32 cnt = le32_to_cpu(mod_array->num_elems);
+
+			for (n = 0; n < cnt; n++, e++) {
+				switch (le32_to_cpu(e->token)) {
+				case 262: /* TDM_SYNC_SRC */
+					mod->sync_src = le32_to_cpu(e->value);
+					break;
+				case 263: /* TDM_DATA_OUT_ENABLE */
+					mod->ctrl_data_out_enable = le32_to_cpu(e->value);
+					break;
+				case 264: /* TDM_SLOT_MASK */
+					mod->slot_mask = le32_to_cpu(e->value);
+					break;
+				case 265: /* TDM_NSLOTS_PER_FRAME */
+					mod->nslots_per_frame = le32_to_cpu(e->value);
+					break;
+				case 266: /* TDM_SLOT_WIDTH */
+					mod->slot_width = le32_to_cpu(e->value);
+					break;
+				case 267: /* TDM_SYNC_MODE */
+					mod->sync_mode = le32_to_cpu(e->value);
+					break;
+				case 268: /* TDM_CTRL_INVERT_SYNC_PULSE */
+					mod->ctrl_invert_sync_pulse = le32_to_cpu(e->value);
+					break;
+				case 269: /* TDM_CTRL_SYNC_DATA_DELAY */
+					mod->ctrl_sync_data_delay = le32_to_cpu(e->value);
+					break;
+				case 272: /* TDM_ACTIVE_LANE_MASK */
+					mod->active_lane_mask = le32_to_cpu(e->value);
+					break;
+				default:
+					break;
+				}
+			}
+			dev_dbg(component->dev,
+				 "ar-debug: tdm tokens sync_src %u out_en %u mask 0x%x slots %u w %u sync_mode %u inv %u dly %u lane 0x%x\n",
+				 mod->sync_src, mod->ctrl_data_out_enable,
+				 mod->slot_mask, mod->nslots_per_frame,
+				 mod->slot_width, mod->sync_mode,
+				 mod->ctrl_invert_sync_pulse, mod->ctrl_sync_data_delay,
+				 mod->active_lane_mask);
+		}
+		break;
 	case MODULE_ID_DISPLAY_PORT_SINK:
 		audioreach_widget_dp_module_load(mod, mod_array);
 		break;
@@ -916,6 +985,7 @@ static int audioreach_widget_ready(struct snd_soc_component *component,
 				   int index, struct snd_soc_dapm_widget *w,
 				   struct snd_soc_tplg_dapm_widget *tplg_w)
 {
+	pr_debug("ar-debug: ready widget %s id=%d\n", w->name, w->id);
 	switch (w->id) {
 	case snd_soc_dapm_aif_in:
 	case snd_soc_dapm_aif_out:
@@ -1039,6 +1109,7 @@ static int audioreach_route_load(struct snd_soc_component *scomp, int index,
 	struct snd_soc_dapm_widget *w;
 	int i;
 
+	pr_debug("ar-debug: route %s -> %s\n", route->source, route->sink);
 	/* check if these are actual modules */
 	src_module = audioreach_find_module(scomp, route->source);
 	sink_module = audioreach_find_module(scomp, route->sink);
@@ -1080,24 +1151,17 @@ static int audioreach_route_unload(struct snd_soc_component *scomp,
 	return 0;
 }
 
-static int audioreach_tplg_complete(struct snd_soc_component *component)
-{
-	/* TBD */
-	return 0;
-}
-
-/* DAI link - used for any driver specific init */
-static int audioreach_link_load(struct snd_soc_component *component, int index,
-				struct snd_soc_dai_link *link,
-				struct snd_soc_tplg_link_config *cfg)
-{
-	link->nonatomic = true;
-	link->dynamic = true;
-	link->platforms->name = NULL;
-	link->platforms->of_node = of_get_compatible_child(component->dev->of_node,
-							   "qcom,q6apm-dais");
-	return 0;
-}
+/*
+ * The FE->BE "virtual mixer" controls are what tie a stream sub-graph to a
+ * device sub-graph: their put() installs the module connection in the
+ * GRAPH_OPEN payload and connects the DAPM path that DPCM walks to find the
+ * backend.  Userspace has to set them, and if it doesn't the first PCM open
+ * fails with "no backend DAIs enabled".  Connect them here when the topology
+ * has been loaded, so a card with a single valid route just works.
+ */
+static bool fe_be_conn = true;
+module_param(fe_be_conn, bool, 0644);
+MODULE_PARM_DESC(fe_be_conn, "put the FE->BE module connection into the BE GRAPH_OPEN payload");
 
 static void audioreach_connect_sub_graphs(struct q6apm *apm,
 					  const struct snd_ar_control *m1,
@@ -1110,7 +1174,7 @@ static void audioreach_connect_sub_graphs(struct q6apm *apm,
 	info = idr_find(&apm->graph_info_idr, m2->graph_id);
 	mutex_unlock(&apm->lock);
 
-	if (connect) {
+	if (connect && fe_be_conn) {
 		info->src_mod_inst_id = m1->module_instance_id;
 		info->src_mod_op_port_id = 1;
 		info->dst_mod_inst_id = m2->module_instance_id;
@@ -1122,6 +1186,10 @@ static void audioreach_connect_sub_graphs(struct q6apm *apm,
 		info->dst_mod_inst_id = 0;
 		info->dst_mod_ip_port_id = 0;
 	}
+	pr_debug("ar-conn: %s m1(g%u inst 0x%x) m2(g%u inst 0x%x) => src 0x%x dst 0x%x\n",
+		connect ? "on" : "off", m1->graph_id, m1->module_instance_id,
+		m2->graph_id, m2->module_instance_id,
+		info->src_mod_inst_id, info->dst_mod_inst_id);
 }
 
 static bool audioreach_is_vmixer_connected(struct q6apm *apm,
@@ -1291,6 +1359,61 @@ static const struct snd_soc_tplg_kcontrol_ops audioreach_io_ops[] = {
 	{SND_SOC_AR_TPLG_VOL_CTL, audioreach_get_vol_ctrl_audio_mixer,
 		audioreach_put_vol_ctrl_audio_mixer, snd_soc_info_volsw},
 };
+
+static bool default_connect = true;
+module_param(default_connect, bool, 0644);
+MODULE_PARM_DESC(default_connect, "connect the FE->BE AR mixer controls when the topology loads");
+
+static int audioreach_tplg_complete(struct snd_soc_component *component)
+{
+	struct snd_soc_card *card = component->card;
+	struct snd_soc_dapm_widget *w;
+	int ret;
+
+	if (!default_connect)
+		return 0;
+
+	if (!card)
+		return 0;
+
+	/* Walk the card widgets: the topology has just created the AR mixer
+	 * widgets, and their kcontrol is the FE->BE connection switch. */
+	list_for_each_entry(w, &card->widgets, list) {
+		struct snd_ctl_elem_value uctl = { 0 };
+		struct snd_kcontrol *kc;
+
+		if (!w->kcontrols || !w->kcontrols[0])
+			continue;
+		kc = w->kcontrols[0];
+		if (kc->get != audioreach_get_audio_mixer)
+			continue;
+
+		uctl.id = kc->id;
+		uctl.value.integer.value[0] = 1;
+		ret = audioreach_put_audio_mixer(kc, &uctl);
+		if (ret) {
+			dev_err(component->dev, "failed to connect %s: %d\n",
+				kc->id.name, ret);
+			continue;
+		}
+		dev_dbg(component->dev, "connected mixer control %s\n", kc->id.name);
+	}
+
+	return 0;
+}
+
+/* DAI link - used for any driver specific init */
+static int audioreach_link_load(struct snd_soc_component *component, int index,
+				struct snd_soc_dai_link *link,
+				struct snd_soc_tplg_link_config *cfg)
+{
+	link->nonatomic = true;
+	link->dynamic = true;
+	link->platforms->name = NULL;
+	link->platforms->of_node = of_get_compatible_child(component->dev->of_node,
+							   "qcom,q6apm-dais");
+	return 0;
+}
 
 static const struct snd_soc_tplg_ops audioreach_tplg_ops = {
 	.io_ops = audioreach_io_ops,

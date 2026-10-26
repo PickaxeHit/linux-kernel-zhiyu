@@ -463,6 +463,23 @@ static int qcom_battmgr_bat_sm8350_update(struct qcom_battmgr *battmgr,
 
 	prop = sm8350_bat_prop_map[psp];
 
+	/*
+	 * The SM8750 firmware answers BATT_POWER_NOW with a stale/zero value, so
+	 * power_now is derived from current and voltage instead: refresh those
+	 * two when the power is asked for.
+	 */
+	if (battmgr->variant == QCOM_BATTMGR_SM8550 &&
+	    psp == POWER_SUPPLY_PROP_POWER_NOW) {
+		mutex_lock(&battmgr->lock);
+		ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+						    BATT_CURR_NOW, 0);
+		if (!ret)
+			ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET,
+							    BATT_VOLT_NOW, 0);
+		mutex_unlock(&battmgr->lock);
+		return ret;
+	}
+
 	mutex_lock(&battmgr->lock);
 	ret = qcom_battmgr_request_property(battmgr, BATTMGR_BAT_PROPERTY_GET, prop, 0);
 	mutex_unlock(&battmgr->lock);
@@ -507,6 +524,22 @@ static int qcom_battmgr_bat_sc8280xp_update(struct qcom_battmgr *battmgr,
 out_unlock:
 	mutex_unlock(&battmgr->lock);
 	return ret;
+}
+
+/*
+ * The SM8750 battery firmware reports capacities in uAh but labels them as
+ * mWh, which made UPower believe the pack was ~12 Wh instead of ~12 Ah.
+ * Convert with the per-cell nominal voltage, matching the uV * uA power the
+ * same firmware reports, so energy and power stay on one scale.
+ */
+#define QCOM_BATTMGR_SM8750_NOMINAL_UV	3850000
+
+static s64 qcom_battmgr_bat_capacity_uwh(struct qcom_battmgr *battmgr, s64 capacity)
+{
+	if (battmgr->variant == QCOM_BATTMGR_SM8550)
+		return capacity * QCOM_BATTMGR_SM8750_NOMINAL_UV / 1000000;
+
+	return capacity;
 }
 
 static int qcom_battmgr_bat_get_property(struct power_supply *psy,
@@ -561,9 +594,29 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 		break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
 		val->intval = battmgr->status.current_now;
+		/*
+		 * The SM8750 battery firmware reports a negative current while the
+		 * battery is charging, but the power supply class (and UPower,
+		 * which forces DISCHARGING whenever current_now < 0) expects
+		 * positive while charging.  Flip it for this platform.
+		 */
+		if (battmgr->variant == QCOM_BATTMGR_SM8550)
+			val->intval = -val->intval;
 		break;
 	case POWER_SUPPLY_PROP_POWER_NOW:
-		val->intval = battmgr->status.power_now;
+		if (battmgr->variant == QCOM_BATTMGR_SM8550) {
+			/*
+			 * The firmware's power_now is not usable on this platform
+			 * (~125 W while idle); derive it from the current and
+			 * voltage it does report.  Negative means charging.
+			 */
+			val->intval = -(s64)battmgr->status.current_now *
+				       battmgr->status.voltage_now / 1000000;
+			if (!val->intval)
+				return -ENODATA;
+		} else {
+			val->intval = battmgr->status.power_now;
+		}
 		break;
 	case POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
 		if (unit != QCOM_BATTMGR_UNIT_mAh)
@@ -591,22 +644,40 @@ static int qcom_battmgr_bat_get_property(struct power_supply *psy,
 	case POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
 		if (unit != QCOM_BATTMGR_UNIT_mWh)
 			return -ENODATA;
-		val->intval = battmgr->info.design_capacity;
+		val->intval = qcom_battmgr_bat_capacity_uwh(battmgr,
+						battmgr->info.design_capacity);
 		break;
 	case POWER_SUPPLY_PROP_ENERGY_FULL:
 		if (unit != QCOM_BATTMGR_UNIT_mWh)
 			return -ENODATA;
-		val->intval = battmgr->info.last_full_capacity;
+		val->intval = qcom_battmgr_bat_capacity_uwh(battmgr,
+						battmgr->info.last_full_capacity);
 		break;
 	case POWER_SUPPLY_PROP_ENERGY_EMPTY:
 		if (unit != QCOM_BATTMGR_UNIT_mWh)
 			return -ENODATA;
-		val->intval = battmgr->info.capacity_low;
+		val->intval = qcom_battmgr_bat_capacity_uwh(battmgr,
+						battmgr->info.capacity_low);
 		break;
 	case POWER_SUPPLY_PROP_ENERGY_NOW:
 		if (unit != QCOM_BATTMGR_UNIT_mWh)
 			return -ENODATA;
-		val->intval = battmgr->status.capacity;
+		/*
+		 * The SM8750 firmware leaves status.capacity empty, which used to
+		 * surface as energy_now == 0 and left UPower without a state of
+		 * charge to work with.  Derive it from the percentage of the
+		 * last full capacity it does report.
+		 */
+		if (battmgr->status.capacity)
+			val->intval = qcom_battmgr_bat_capacity_uwh(battmgr,
+						battmgr->status.capacity);
+		else if (battmgr->info.last_full_capacity &&
+			 battmgr->status.percent != (unsigned int)-1)
+			val->intval = qcom_battmgr_bat_capacity_uwh(battmgr,
+						(s64)battmgr->info.last_full_capacity *
+						battmgr->status.percent / 100);
+		else
+			return -ENODATA;
 		break;
 	case POWER_SUPPLY_PROP_CAPACITY:
 		if (battmgr->status.percent == (unsigned int)-1)
@@ -873,12 +944,21 @@ static const enum power_supply_property sm8350_bat_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_POWER_NOW,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_CHARGE_COUNTER,
 	POWER_SUPPLY_PROP_CYCLE_COUNT,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
 	POWER_SUPPLY_PROP_CHARGE_FULL,
+	/*
+	 * The SM8750 battery firmware reports its capacities in mWh, so the
+	 * charge_* properties above answer -ENODATA and UPower cannot derive a
+	 * full-capacity or a state of health.  Expose the energy_* view as well.
+	 */
+	POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN,
+	POWER_SUPPLY_PROP_ENERGY_FULL,
+	POWER_SUPPLY_PROP_ENERGY_NOW,
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
@@ -905,18 +985,32 @@ static const enum power_supply_property sm8550_bat_props[] = {
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_CURRENT_NOW,
+	POWER_SUPPLY_PROP_POWER_NOW,
 	POWER_SUPPLY_PROP_TEMP,
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_CHARGE_COUNTER,
 	POWER_SUPPLY_PROP_CYCLE_COUNT,
 	POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN,
 	POWER_SUPPLY_PROP_CHARGE_FULL,
+	/*
+	 * The SM8750 battery firmware reports capacities in mWh, so charge_*
+	 * answers -ENODATA.  Expose the energy_* view so UPower can compute a
+	 * full capacity, a state of health and charge/discharge times.
+	 */
+	POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN,
+	POWER_SUPPLY_PROP_ENERGY_FULL,
+	POWER_SUPPLY_PROP_ENERGY_NOW,
 	POWER_SUPPLY_PROP_MODEL_NAME,
 	POWER_SUPPLY_PROP_TIME_TO_FULL_AVG,
 	POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG,
 	POWER_SUPPLY_PROP_INTERNAL_RESISTANCE,
 	POWER_SUPPLY_PROP_STATE_OF_HEALTH,
-	POWER_SUPPLY_PROP_POWER_NOW,
+	/*
+	 * The SM8750 firmware reports power_now in a unit we cannot trust
+	 * (it reads ~125 W while the pack takes ~4 W), and UPower prefers it
+	 * over its own energy delta.  Leave it out so the rate is derived
+	 * from energy_now instead.
+	 */
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_START_THRESHOLD,
 	POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
 };

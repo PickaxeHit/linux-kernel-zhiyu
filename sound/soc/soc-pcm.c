@@ -976,22 +976,31 @@ static int __soc_pcm_open(struct snd_soc_pcm_runtime *rtd,
 		pinctrl_pm_select_default_state(component->dev);
 
 	ret = snd_soc_pcm_component_pm_runtime_get(rtd, substream);
-	if (ret < 0)
+	if (ret < 0) {
+		pr_debug("ar-open-dbg: pm_runtime_get %d\n", ret);
 		goto err;
+	}
 
 	ret = soc_pcm_components_open(substream);
-	if (ret < 0)
+	if (ret < 0) {
+		pr_debug("ar-open-dbg: components_open %d\n", ret);
 		goto err;
+	}
 
 	ret = snd_soc_link_startup(substream);
-	if (ret < 0)
+	if (ret < 0) {
+		pr_debug("ar-open-dbg: link_startup %d\n", ret);
 		goto err;
+	}
 
 	/* startup the audio subsystem */
 	for_each_rtd_dais(rtd, i, dai) {
 		ret = snd_soc_dai_startup(dai, substream);
-		if (ret < 0)
+		if (ret < 0) {
+			pr_debug("ar-open-dbg: dai_startup %s ret %d\n",
+				dai->name, ret);
 			goto err;
+		}
 	}
 
 	/* Dynamic PCM DAI links compat checks use dynamic capabilities */

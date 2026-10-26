@@ -96,6 +96,7 @@ struct ieee80211_rx_status;
 #define ATH12K_DEFAULT_CAL_FILE		"caldata.bin"
 #define ATH12K_AMSS_FILE		"amss.bin"
 #define ATH12K_M3_FILE			"m3.bin"
+#define ATH12K_QDSS_FILE		"qdss.cfg"
 #define ATH12K_AUX_UC_FILE		"aux_ucode.bin"
 #define ATH12K_REGDB_FILE_NAME		"regdb.bin"
 
@@ -187,6 +188,12 @@ struct ath12k_hw_params {
 
 	u16 interface_modes;
 	bool supports_monitor:1;
+
+	/* Platform TX power limit the vendor host driver sends with the SAR
+	 * reason in WMI_PDEV_PARAM_TXPOWER_LIMIT2G/5G, in that parameter's
+	 * units (ath12k programs it in 0.5 dB steps); 0 = none.
+	 */
+	u8 pdev_txpower_sar_limit;
 
 	bool idle_ps:1;
 	bool download_calib:1;

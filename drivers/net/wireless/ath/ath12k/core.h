@@ -15,6 +15,7 @@
 #include <linux/ctype.h>
 #include <linux/firmware.h>
 #include <linux/of_reserved_mem.h>
+#include <linux/panic_notifier.h>
 #include <linux/average.h>
 #include <linux/of.h>
 #include <linux/rhashtable.h>
@@ -156,6 +157,7 @@ enum ath12k_hw_rev {
 	ATH12K_HW_QCN9274_HW20,
 	ATH12K_HW_WCN7850_HW20,
 	ATH12K_HW_IPQ5332_HW10,
+	ATH12K_HW_WCN7860_HW20,
 	ATH12K_HW_QCC2072_HW10,
 	ATH12K_HW_IPQ5424_HW10,
 };
@@ -1144,6 +1146,8 @@ struct ath12k_base {
 	} acpi;
 
 #endif /* CONFIG_ACPI */
+
+	struct notifier_block panic_nb;
 
 	struct ath12k_hw_group *ag;
 	struct ath12k_wsi_info wsi_info;

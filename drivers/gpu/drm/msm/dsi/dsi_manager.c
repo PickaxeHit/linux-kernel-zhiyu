@@ -5,6 +5,7 @@
 
 #include "drm/drm_bridge_connector.h"
 
+#include <drm/drm_vblank.h>
 #include "msm_kms.h"
 #include "dsi.h"
 
@@ -278,6 +279,8 @@ static void dsi_mgr_bridge_power_off(struct drm_bridge *bridge)
 static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 {
 	int id = dsi_mgr_bridge_get_id(bridge);
+
+	pr_debug("[EN] dsi_mgr pre_enable id=%d\n", id);
 	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
 	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
 	struct mipi_dsi_host *host = msm_dsi->host;
@@ -296,26 +299,41 @@ static void dsi_mgr_bridge_pre_enable(struct drm_bridge *bridge)
 		return;
 	}
 
+	return;
+}
+
+/*
+ * Start the DSI video engine here rather than in pre_enable: the core runs the
+ * encoder's atomic_enable (which starts the DPU interface that feeds the link)
+ * between pre_enable and enable.  Enabling the link first makes it starve for
+ * the first frames and latch a FIFO underflow, which leaves the display black
+ * after a DPMS cycle.
+ */
+static void dsi_mgr_bridge_enable(struct drm_bridge *bridge)
+{
+	int id = dsi_mgr_bridge_get_id(bridge);
+	struct msm_dsi *msm_dsi = dsi_mgr_get_dsi(id);
+	struct msm_dsi *msm_dsi1 = dsi_mgr_get_dsi(DSI_1);
+	struct mipi_dsi_host *host = msm_dsi->host;
+	bool is_bonded_dsi = IS_BONDED_DSI();
+	int ret;
+
+	DBG("id=%d", id);
+
+	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
+		return;
+
 	ret = msm_dsi_host_enable(host);
 	if (ret) {
 		pr_err("%s: enable host %d failed, %d\n", __func__, id, ret);
-		goto host_en_fail;
+		return;
 	}
 
 	if (is_bonded_dsi && msm_dsi1) {
 		ret = msm_dsi_host_enable(msm_dsi1->host);
-		if (ret) {
+		if (ret)
 			pr_err("%s: enable host1 failed, %d\n", __func__, ret);
-			goto host1_en_fail;
-		}
 	}
-
-	return;
-
-host1_en_fail:
-	msm_dsi_host_disable(host);
-host_en_fail:
-	dsi_mgr_bridge_power_off(bridge);
 }
 
 void msm_dsi_manager_tpg_enable(void)
@@ -364,19 +382,28 @@ static void dsi_mgr_bridge_post_disable(struct drm_bridge *bridge)
 	if (is_bonded_dsi && msm_dsi1)
 		msm_dsi_host_disable_irq(msm_dsi1->host);
 
-	/* Save PHY status if it is a clock source */
+	/*
+	 * Save the PHY state for both links.  The slave PHY does not own the
+	 * PLL, but its clock post-dividers (CMN_CLK_CFG0) are reset by the
+	 * PHY power cycle and have to be restored, otherwise its byte/pixel
+	 * clocks come back at the reset divider and the second DSI link
+	 * starves (lane FIFO overflow, black panel after a DPMS cycle).
+	 */
 	msm_dsi_phy_pll_save_state(msm_dsi->phy);
+	if (is_bonded_dsi && msm_dsi1)
+		msm_dsi_phy_pll_save_state(msm_dsi1->phy);
 
-	ret = msm_dsi_host_power_off(host);
-	if (ret)
-		pr_err("%s: host %d power off failed,%d\n", __func__, id, ret);
-
+	/* Stop the external-clock consumer before its clock-source host. */
 	if (is_bonded_dsi && msm_dsi1) {
 		ret = msm_dsi_host_power_off(msm_dsi1->host);
 		if (ret)
 			pr_err("%s: host1 power off failed, %d\n",
 								__func__, ret);
 	}
+
+	ret = msm_dsi_host_power_off(host);
+	if (ret)
+		pr_err("%s: host %d power off failed,%d\n", __func__, id, ret);
 
 disable_phy:
 	dsi_mgr_phy_disable(id);
@@ -392,6 +419,8 @@ static void dsi_mgr_bridge_mode_set(struct drm_bridge *bridge,
 	struct mipi_dsi_host *host = msm_dsi->host;
 	bool is_bonded_dsi = IS_BONDED_DSI();
 
+	pr_debug("[EN] dsi_mgr mode_set id=%d %dx%d@%d\n", id, mode->hdisplay,
+		mode->vdisplay, drm_mode_vrefresh(mode));
 	DBG("set mode: " DRM_MODE_FMT, DRM_MODE_ARG(mode));
 
 	if (is_bonded_dsi && !IS_MASTER_DSI_LINK(id))
@@ -447,6 +476,7 @@ static int dsi_mgr_bridge_attach(struct drm_bridge *bridge,
 static const struct drm_bridge_funcs dsi_mgr_bridge_funcs = {
 	.attach = dsi_mgr_bridge_attach,
 	.pre_enable = dsi_mgr_bridge_pre_enable,
+	.enable = dsi_mgr_bridge_enable,
 	.post_disable = dsi_mgr_bridge_post_disable,
 	.mode_set = dsi_mgr_bridge_mode_set,
 	.mode_valid = dsi_mgr_bridge_mode_valid,

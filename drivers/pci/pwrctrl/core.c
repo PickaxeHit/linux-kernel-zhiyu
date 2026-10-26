@@ -344,6 +344,16 @@ static int pci_pwrctrl_create_device(struct device_node *np,
 		return 0;
 	}
 
+	/*
+	 * PCI bridge nodes (e.g. pcieport0) are already populated by the PCI
+	 * core; of_platform_device_create() returns NULL for them.  Skip such
+	 * nodes instead of failing, otherwise the whole host init aborts.
+	 */
+	if (of_node_check_flag(np, OF_POPULATED)) {
+		dev_dbg(parent, "OF node %s already populated, skipping\n", np->name);
+		return 0;
+	}
+
 	/* Now create the pwrctrl device */
 	pdev = of_platform_device_create(np, NULL, parent);
 	if (!pdev) {

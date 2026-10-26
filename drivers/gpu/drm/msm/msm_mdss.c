@@ -30,6 +30,8 @@ struct msm_mdss_data {
 
 struct msm_mdss {
 	struct device *dev;
+	/* Deferred: keep the display subsystem out of power collapse */
+	struct delayed_work keep_powered;
 
 	void __iomem *mmio;
 	struct clk_bulk_data *clocks;
@@ -298,6 +300,8 @@ static void msm_mdss_destroy(struct msm_mdss *msm_mdss)
 	struct platform_device *pdev = to_platform_device(msm_mdss->dev);
 	int irq;
 
+	cancel_delayed_work_sync(&msm_mdss->keep_powered);
+	pm_runtime_allow(msm_mdss->dev);
 	pm_runtime_suspend(msm_mdss->dev);
 	pm_runtime_disable(msm_mdss->dev);
 	irq_domain_remove(msm_mdss->irq_controller.domain);
@@ -362,6 +366,108 @@ static int mdp5_mdss_parse_clock(struct platform_device *pdev, struct clk_bulk_d
 	return num_clocks;
 }
 
+static struct msm_mdss *mdss_instance;
+
+static void hw_dump_clocks(void)
+{
+	void __iomem *d;
+	u32 pll_opmode, pll_state, pll_status, pll_l, pll_alpha, pll_user;
+	u32 mdp, rcg_cmd, rcg_cfg, rcg_m, rcg_n, rcg_d;
+
+	d = ioremap(0xaf00000, 0x9000);
+	if (!d) {
+		pr_err("[HW] dispcc ioremap failed\n");
+		return;
+	}
+	pll_opmode = readl(d + 0x04);
+	pll_state = readl(d + 0x08);
+	pll_status = readl(d + 0x0c);
+	pll_l = readl(d + 0x10);
+	pll_alpha = readl(d + 0x14);
+	pll_user = readl(d + 0x18);
+	mdp = readl(d + 0x8010);
+	rcg_cmd = readl(d + 0x8150);
+	rcg_cfg = readl(d + 0x8154);
+	rcg_m = readl(d + 0x8158);
+	rcg_n = readl(d + 0x815c);
+	rcg_d = readl(d + 0x8160);
+	iounmap(d);
+
+	pr_info("[HW] pll0 opmode=%#x state=%#x status=%#x L=%#x alpha=%#x user=%#x\n",
+		pll_opmode, pll_state, pll_status, pll_l, pll_alpha, pll_user);
+	pr_info("[HW] mdp_clk(8010)=%#x%s rcg cmd=%#x cfg=%#x m=%#x n=%#x d=%#x\n",
+		mdp, (mdp & BIT(31)) ? " HALTED" : " running",
+		rcg_cmd, rcg_cfg, rcg_m, rcg_n, rcg_d);
+}
+
+static int msm_mdss_hw_dump_set(const char *val, const struct kernel_param *kp)
+{
+	hw_dump_clocks();
+	return 0;
+}
+
+static const struct kernel_param_ops msm_mdss_hw_dump_ops = {
+	.set = msm_mdss_hw_dump_set,
+};
+
+static int hw_dump_dummy;
+module_param_cb(msm_hw_dump, &msm_mdss_hw_dump_ops, &hw_dump_dummy, 0200);
+
+static bool mdss_keep_powered = true;
+
+static int mdss_keep_powered_set(const char *val, const struct kernel_param *kp)
+{
+	bool enable;
+	int ret = kstrtobool(val, &enable);
+
+	if (ret)
+		return ret;
+
+	if (mdss_instance) {
+		if (enable)
+			pm_runtime_forbid(mdss_instance->dev);
+		else
+			pm_runtime_allow(mdss_instance->dev);
+	}
+	mdss_keep_powered = enable;
+	pr_info("[MDSS] keep_powered=%d (runtime PM %s)\n", enable,
+		enable ? "forbidden" : "allowed");
+	return 0;
+}
+
+static const struct kernel_param_ops mdss_keep_powered_ops = {
+	.set = mdss_keep_powered_set,
+	.get = param_get_bool,
+};
+
+module_param_cb(mdss_keep_powered, &mdss_keep_powered_ops, &mdss_keep_powered, 0644);
+MODULE_PARM_DESC(mdss_keep_powered,
+		 "Keep MDSS runtime-PM active to hide display power-collapse bugs");
+
+static void mdss_keep_powered_work(struct work_struct *work)
+{
+	struct msm_mdss *mdss = container_of(to_delayed_work(work),
+					     struct msm_mdss, keep_powered);
+
+	/*
+	 * An MDSS power collapse loses state the DPU/DSI need for the next
+	 * frame commit: blanking works, but the panel never comes back on
+	 * unblank. Keeping the display subsystem runtime-PM active (the
+	 * in-kernel equivalent of the vendor port's udev power/control=on)
+	 * leaves DPU, DSI hosts, PHYs and the backlight free to follow normal
+	 * display blanking while MMCX/MDSS stays powered.
+	 *
+	 * Deferred: forcing a resume from probe, or from inside the resume
+	 * callback, runs the enable path before it is ready.
+	 */
+	if (!mdss_keep_powered)
+		return;
+
+	pm_runtime_forbid(mdss->dev);
+	mdss_instance = mdss;
+	dev_dbg(mdss->dev, "display power collapse disabled (blank/unblank state)\n");
+}
+
 static struct msm_mdss *msm_mdss_init(struct platform_device *pdev, bool is_mdp5)
 {
 	const struct msm_mdss_data *mdss_data;
@@ -423,6 +529,10 @@ static struct msm_mdss *msm_mdss_init(struct platform_device *pdev, bool is_mdp5
 
 	pm_runtime_enable(&pdev->dev);
 
+	mdss_instance = msm_mdss;
+	INIT_DELAYED_WORK(&msm_mdss->keep_powered, mdss_keep_powered_work);
+	schedule_delayed_work(&msm_mdss->keep_powered, msecs_to_jiffies(5000));
+
 	return msm_mdss;
 }
 
@@ -430,16 +540,104 @@ static int __maybe_unused mdss_runtime_suspend(struct device *dev)
 {
 	struct msm_mdss *mdss = dev_get_drvdata(dev);
 
+	pr_debug("[SUSP] mdss_runtime_suspend\n");
+
 	DBG("");
 
 	return msm_mdss_disable(mdss);
 }
 
+/*
+ * Force a real power cycle of the MDSS core GDSC.
+ *
+ * The GDSC is left in HW-trigger mode (gdsc_enable() sets HW_CONTROL), so the
+ * domain can be powered down by the hardware as soon as the MDSS clocks are
+ * gated - without genpd noticing.  A resume therefore often has no software
+ * power-on edge at all: the registers read back exactly like the working
+ * state, but the blocks never went through their power-on reset, which shows
+ * up as a DSI command engine that stays busy forever and a CTL whose software
+ * reset never completes.
+ *
+ * Reproduce the edge by clearing HW_CONTROL, asserting SW_COLLAPSE, waiting
+ * for PWR_ON to drop, then releasing it and restoring HW_CONTROL.
+ */
+#define DISP_CC_MDSS_CORE_GDSCR	0xaf09000
+#define GDSCR_PWR_ON		BIT(31)
+#define GDSCR_HW_CONTROL	BIT(1)
+#define GDSCR_SW_COLLAPSE	BIT(0)
+
+static bool mdss_power_cycle;
+module_param(mdss_power_cycle, bool, 0644);
+MODULE_PARM_DESC(mdss_power_cycle,
+		 "Force an MDSS GDSC power cycle on runtime resume (experiment; "
+		 "does not fix the s2idle resume failure, off by default)");
+
+static void msm_mdss_force_power_cycle(struct device *dev)
+{
+	void __iomem *gdscr;
+	u32 val;
+	int i;
+
+	gdscr = ioremap(DISP_CC_MDSS_CORE_GDSCR, 4);
+	if (!gdscr) {
+		dev_warn(dev, "cannot map MDSS GDSCR, skipping power cycle\n");
+		return;
+	}
+
+	val = readl(gdscr);
+	if (!(val & GDSCR_PWR_ON)) {
+		/* Already powered down: nothing to cycle, just bring it up. */
+		writel(val & ~GDSCR_HW_CONTROL & ~GDSCR_SW_COLLAPSE, gdscr);
+		goto out;
+	}
+
+	/* Hand control to software and collapse. */
+	writel((val & ~GDSCR_HW_CONTROL) | GDSCR_SW_COLLAPSE, gdscr);
+	for (i = 0; i < 1000; i++) {
+		if (!(readl(gdscr) & GDSCR_PWR_ON))
+			break;
+		udelay(10);
+	}
+	if (i == 1000)
+		dev_warn(dev, "MDSS GDSC did not collapse\n");
+
+	/* Release and let it come back up. */
+	writel(val & ~GDSCR_SW_COLLAPSE, gdscr);
+	for (i = 0; i < 1000; i++) {
+		if (readl(gdscr) & GDSCR_PWR_ON)
+			break;
+		udelay(10);
+	}
+	if (i == 1000)
+		dev_warn(dev, "MDSS GDSC did not power back up\n");
+
+out:
+	/* Restore HW-trigger mode. */
+	writel(val, gdscr);
+	dev_dbg(dev, "MDSS GDSC power cycled\n");
+	iounmap(gdscr);
+}
+
 static int __maybe_unused mdss_runtime_resume(struct device *dev)
 {
 	struct msm_mdss *mdss = dev_get_drvdata(dev);
+	int ret;
+
+	pr_debug("[SUSP] mdss_runtime_resume\n");
 
 	DBG("");
+
+	/*
+	 * The MDSS loses its internal state on a power collapse; re-run the
+	 * reset sequence that is otherwise only done once at probe, then
+	 * re-program the registers (UBWC etc.).
+	 */
+	if (mdss_power_cycle)
+		msm_mdss_force_power_cycle(dev);
+
+	ret = msm_mdss_reset(dev);
+	if (ret)
+		dev_warn(dev, "MDSS reset on resume failed: %d\n", ret);
 
 	return msm_mdss_enable(mdss);
 }

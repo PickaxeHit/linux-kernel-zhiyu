@@ -137,9 +137,32 @@ struct pmic_glink_altmode {
 	struct pmic_glink_client *client;
 
 	struct work_struct enable_work;
+	spinlock_t work_lock;
+	bool stopping;
 
 	struct pmic_glink_altmode_port ports[PMIC_GLINK_MAX_PORTS];
 };
+
+static void pmic_glink_altmode_queue(struct pmic_glink_altmode *altmode,
+				     struct work_struct *work)
+{
+	guard(spinlock_irqsave)(&altmode->work_lock);
+	if (!altmode->stopping)
+		schedule_work(work);
+}
+
+static void pmic_glink_altmode_stop(void *data)
+{
+	struct pmic_glink_altmode *altmode = data;
+	unsigned int port;
+
+	scoped_guard(spinlock_irqsave, &altmode->work_lock)
+		altmode->stopping = true;
+	cancel_work_sync(&altmode->enable_work);
+	for (port = 0; port < ARRAY_SIZE(altmode->ports); port++)
+		if (altmode->ports[port].altmode)
+			cancel_work_sync(&altmode->ports[port].work);
+}
 
 static int pmic_glink_altmode_request(struct pmic_glink_altmode *altmode, u32 cmd, u32 arg)
 {
@@ -174,28 +197,34 @@ static int pmic_glink_altmode_request(struct pmic_glink_altmode *altmode, u32 cm
 	return 0;
 }
 
-static void pmic_glink_altmode_enable_dp(struct pmic_glink_altmode *altmode,
-					 struct pmic_glink_altmode_port *port,
-					 u8 mode, bool hpd_state,
-					 bool hpd_irq)
+static int pmic_glink_altmode_enable_dp(struct pmic_glink_altmode *altmode,
+				      struct pmic_glink_altmode_port *port,
+				      u8 mode, bool hpd_state, bool hpd_irq)
 {
 	struct typec_displayport_data dp_data = {};
 	int ret;
+
+	if (mode > DP_PIN_ASSIGN_F) {
+		dev_err(altmode->dev, "invalid DP pin assignment index: %u\n", mode);
+		return -EINVAL;
+	}
 
 	dp_data.status = DP_STATUS_ENABLED;
 	if (hpd_state)
 		dp_data.status |= DP_STATUS_HPD_STATE;
 	if (hpd_irq)
 		dp_data.status |= DP_STATUS_IRQ_HPD;
-	dp_data.conf = DP_CONF_SET_PIN_ASSIGN(mode);
+	dp_data.conf = DP_CONF_SET_PIN_ASSIGN(BIT(mode));
 
 	port->state.alt = &port->dp_alt;
 	port->state.data = &dp_data;
 	port->state.mode = TYPEC_MODAL_STATE(mode);
 
 	ret = typec_mux_set(port->typec_mux, &port->state);
-	if (ret)
+	if (ret) {
 		dev_err(altmode->dev, "failed to switch mux to DP: %d\n", ret);
+		return ret;
+	}
 
 	port->retimer_state.alt = &port->dp_alt;
 	port->retimer_state.data = &dp_data;
@@ -204,6 +233,8 @@ static void pmic_glink_altmode_enable_dp(struct pmic_glink_altmode *altmode,
 	ret = typec_retimer_set(port->typec_retimer, &port->retimer_state);
 	if (ret)
 		dev_err(altmode->dev, "failed to setup retimer to DP: %d\n", ret);
+
+	return ret;
 }
 
 static void pmic_glink_altmode_enable_tbt(struct pmic_glink_altmode *altmode,
@@ -351,8 +382,11 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 	struct pmic_glink_altmode_port *alt_port = work_to_altmode_port(work);
 	struct pmic_glink_altmode *altmode = alt_port->altmode;
 	enum drm_connector_status conn_status;
+	int ret;
 
-	typec_switch_set(alt_port->typec_switch, alt_port->orientation);
+	ret = typec_switch_set(alt_port->typec_switch, alt_port->orientation);
+	if (ret)
+		dev_err(altmode->dev, "failed to set orientation: %d\n", ret);
 
 	/*
 	 * MUX_CTRL_STATE_DP4LN/USB3_DP may only be set if SVID=DP, but we need
@@ -362,12 +396,16 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 	if (alt_port->svid == USB_TYPEC_DP_SID) {
 		if (alt_port->mux_ctrl == MUX_CTRL_STATE_NO_CONN) {
 			pmic_glink_altmode_safe(altmode, alt_port);
-		} else {
-			pmic_glink_altmode_enable_dp(altmode, alt_port,
-						     alt_port->mode,
-						     alt_port->hpd_state,
-						     alt_port->hpd_irq);
+		} else if (!ret) {
+			ret = pmic_glink_altmode_enable_dp(altmode, alt_port,
+							 alt_port->mode,
+							 alt_port->hpd_state,
+							 alt_port->hpd_irq);
 		}
+
+		/* Preserve disconnect notification even if routing cleanup failed. */
+		if (ret && alt_port->hpd_state)
+			goto out_ack;
 
 		if (alt_port->hpd_state)
 			conn_status = connector_status_connected;
@@ -375,6 +413,8 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 			conn_status = connector_status_disconnected;
 
 		drm_aux_hpd_bridge_notify(&alt_port->bridge->dev, conn_status);
+	} else if (ret) {
+		goto out_ack;
 	} else if (alt_port->mux_ctrl == MUX_CTRL_STATE_TUNNELING) {
 		if (alt_port->svid == USB_TYPEC_TBT_SID)
 			pmic_glink_altmode_enable_tbt(altmode, alt_port);
@@ -390,6 +430,7 @@ static void pmic_glink_altmode_worker(struct work_struct *work)
 		pmic_glink_altmode_safe(altmode, alt_port);
 	}
 
+out_ack:
 	pmic_glink_altmode_request(altmode, ALTMODE_PAN_ACK, alt_port->index);
 }
 
@@ -451,7 +492,7 @@ static void pmic_glink_altmode_sc8180xp_notify(struct pmic_glink_altmode *altmod
 	alt_port->mode = mode;
 	alt_port->hpd_state = hpd_state;
 	alt_port->hpd_irq = hpd_irq;
-	schedule_work(&alt_port->work);
+	pmic_glink_altmode_queue(altmode, &alt_port->work);
 }
 
 #define SC8280XP_DPAM_MASK	0x3f
@@ -502,7 +543,7 @@ static void pmic_glink_altmode_sc8280xp_notify(struct pmic_glink_altmode *altmod
 		alt_port->tbt_data = *tbt;
 	}
 
-	schedule_work(&alt_port->work);
+	pmic_glink_altmode_queue(altmode, &alt_port->work);
 }
 
 static void pmic_glink_altmode_callback(const void *data, size_t len, void *priv)
@@ -558,7 +599,7 @@ static void pmic_glink_altmode_pdr_notify(void *priv, int state)
 	struct pmic_glink_altmode *altmode = priv;
 
 	if (state == SERVREG_SERVICE_STATE_UP)
-		schedule_work(&altmode->enable_work);
+		pmic_glink_altmode_queue(altmode, &altmode->enable_work);
 }
 
 static const struct of_device_id pmic_glink_altmode_of_quirks[] = {
@@ -592,6 +633,7 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 	INIT_WORK(&altmode->enable_work, pmic_glink_altmode_enable_worker);
 	init_completion(&altmode->pan_ack);
 	mutex_init(&altmode->lock);
+	spin_lock_init(&altmode->work_lock);
 
 	device_for_each_child_node(dev, fwnode) {
 		ret = fwnode_property_read_u32(fwnode, "reg", &port);
@@ -694,6 +736,10 @@ static int pmic_glink_altmode_probe(struct auxiliary_device *adev,
 						       altmode);
 	if (IS_ERR(altmode->client))
 		return PTR_ERR(altmode->client);
+
+	ret = devm_add_action_or_reset(dev, pmic_glink_altmode_stop, altmode);
+	if (ret)
+		return ret;
 
 	pmic_glink_client_register(altmode->client);
 

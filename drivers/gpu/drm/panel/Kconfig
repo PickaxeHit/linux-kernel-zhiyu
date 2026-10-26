@@ -612,6 +612,15 @@ config DRM_PANEL_NOVATEK_NT35950
 	  Sharp panels used in Sony Xperia Z5 Premium and XZ Premium
 	  mobile phones.
 
+config DRM_PANEL_NOVATEK_NT36526
+	tristate "Novatek NT36526 panel driver"
+	depends on DRM && DRM_MIPI_DSI
+	depends on BACKLIGHT_CLASS_DEVICE
+	help
+	  Novatek NT36526 dual-DSI DSC panel (Lenovo TB378FC).
+	  Say Y here if you want to enable support for the NT36526E TDDI
+	  panel with CSOT glass used in this device.
+
 config DRM_PANEL_NOVATEK_NT36523
 	tristate "Novatek NT36523 panel driver"
 	depends on OF

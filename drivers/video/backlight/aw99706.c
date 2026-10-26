@@ -10,6 +10,8 @@
  */
 
 #include <linux/backlight.h>
+#include <linux/device/bus.h>
+#include <linux/of.h>
 #include <linux/bitfield.h>
 #include <linux/delay.h>
 #include <linux/gpio/consumer.h>
@@ -174,8 +176,18 @@ struct aw99706_device {
 	struct regmap *regmap;
 	struct backlight_device *bl_dev;
 	struct gpio_desc *hwen_gpio;
+	/* Optional second IC of a dual-backlight panel: driven by this
+	 * instance so that both halves share one backlight device. */
+	struct i2c_client *slave;
+	struct regmap *slave_regmap;
 	struct reg_init_data init_tbl[ARRAY_SIZE(aw99706_dt_props)];
 	bool bl_enable;
+	/* Optional lower bound for a non-zero brightness, from DT. */
+	u32 min_brightness;
+	/* Dual-IC panels: the slave shares the master's HWEN line, so its
+	 * probe runs before the line is up and the init writes are dropped.
+	 * Re-run the init once the master has powered the rail. */
+	struct delayed_work reinit_work;
 };
 
 enum reg_access {
@@ -277,13 +289,70 @@ static void aw99706_dt_parse(struct aw99706_device *aw,
 
 	if (bl_props->brightness > bl_props->max_brightness)
 		bl_props->brightness = bl_props->max_brightness;
+
+	device_property_read_u32(aw->dev, "awinic,min-brightness",
+				 &aw->min_brightness);
+	if (aw->min_brightness > bl_props->max_brightness)
+		aw->min_brightness = bl_props->max_brightness;
+}
+
+static struct i2c_client *aw99706_get_slave(struct device *dev)
+{
+	struct device_node *np;
+	struct i2c_adapter *adap;
+	struct i2c_board_info info = {};
+	struct i2c_client *cli;
+	u32 addr;
+
+	np = of_parse_phandle(dev->of_node, "awinic,slave-backlight", 0);
+	if (!np)
+		return NULL;
+
+	adap = of_find_i2c_adapter_by_node(np->parent);
+	if (!adap) {
+		of_node_put(np);
+		return NULL;
+	}
+
+	cli = NULL;
+	if (!of_property_read_u32(np, "awinic,slave-addr", &addr)) {
+		strscpy(info.type, "aw99706-slave", I2C_NAME_SIZE);
+		info.addr = addr;
+		info.fwnode = of_fwnode_handle(np);
+		cli = i2c_new_client_device(adap, &info);
+		if (IS_ERR(cli)) {
+			of_node_put(np);
+			cli = NULL;
+		}
+	}
+
+	i2c_put_adapter(adap);
+	of_node_put(np);
+
+	return cli;
+}
+
+static void aw99706_slave_init(struct aw99706_device *aw)
+{
+	static const u8 seq[][2] = {
+		{ 0x0d, 0x00 }, { 0x0c, 0x48 }, { 0x06, 0xd9 }, { 0x07, 0x05 },
+		{ 0x04, 0x00 }, { 0x05, 0x00 }, { 0x08, 0x01 }, { 0x0d, 0xfe },
+	};
+	int i;
+
+	if (!aw->slave_regmap)
+		return;
+
+	for (i = 0; i < ARRAY_SIZE(seq); i++)
+		regmap_write(aw->slave_regmap, seq[i][0], seq[i][1]);
 }
 
 static int aw99706_hw_init(struct aw99706_device *aw)
 {
 	int ret, i;
 
-	gpiod_set_value_cansleep(aw->hwen_gpio, 1);
+	if (aw->hwen_gpio)
+		gpiod_set_value_cansleep(aw->hwen_gpio, 1);
 
 	for (i = 0; i < ARRAY_SIZE(aw->init_tbl); i++) {
 		ret = aw99706_i2c_update_bits(aw, aw->init_tbl[i].reg,
@@ -294,6 +363,28 @@ static int aw99706_hw_init(struct aw99706_device *aw)
 			return ret;
 		}
 	}
+
+	/* Vendor (msm_drm aw99706b_init_table) writes CFG6/7/8/C/D, which the
+	 * generic property table above does not cover.  Without these the LED
+	 * string stays dark on this panel. */
+	{
+		static const u8 vendor_init[][2] = {
+			{ 0x0d, 0x00 }, { 0x0c, 0x48 }, { 0x06, 0xd9 },
+			{ 0x07, 0x05 }, { 0x04, 0x00 }, { 0x05, 0x00 },
+			{ 0x08, 0x01 }, { 0x0d, 0xfe },
+		};
+
+		for (i = 0; i < ARRAY_SIZE(vendor_init); i++) {
+			ret = aw99706_i2c_write(aw, vendor_init[i][0], vendor_init[i][1]);
+			if (ret < 0) {
+				dev_err(aw->dev, "vendor init reg 0x%02x failed\n",
+					vendor_init[i][0]);
+				return ret;
+			}
+		}
+	}
+
+	aw99706_slave_init(aw);
 
 	return 0;
 }
@@ -317,6 +408,12 @@ static int aw99706_update_brightness(struct aw99706_device *aw, u32 brt_lvl)
 	bool bl_enable_now = !!brt_lvl;
 	int ret;
 
+	/* Optional floor from DT ("awinic,min-brightness"); zero still means
+	 * "off" (the DRM disables the backlight through the power state on
+	 * blank). */
+	if (brt_lvl && brt_lvl < aw->min_brightness)
+		brt_lvl = aw->min_brightness;
+
 	ret = aw99706_i2c_write(aw, AW99706_CFG4_REG,
 				(brt_lvl >> 8) & AW99706_BRT_MSB_MASK);
 	if (ret < 0)
@@ -326,6 +423,13 @@ static int aw99706_update_brightness(struct aw99706_device *aw, u32 brt_lvl)
 				brt_lvl & AW99706_BRT_LSB_MASK);
 	if (ret < 0)
 		return ret;
+
+	if (aw->slave_regmap) {
+		regmap_write(aw->slave_regmap, AW99706_CFG4_REG,
+			     (brt_lvl >> 8) & AW99706_BRT_MSB_MASK);
+		regmap_write(aw->slave_regmap, AW99706_CFG5_REG,
+			     brt_lvl & AW99706_BRT_LSB_MASK);
+	}
 
 	if (aw->bl_enable != bl_enable_now) {
 		ret = aw99706_bl_enable(aw, bl_enable_now);
@@ -368,6 +472,29 @@ static int aw99706_chip_id_read(struct aw99706_device *aw)
 	return val;
 }
 
+static void aw99706_reinit_work(struct work_struct *work)
+{
+	struct aw99706_device *aw =
+		container_of(to_delayed_work(work), struct aw99706_device,
+			     reinit_work);
+	int ret;
+
+	ret = aw99706_hw_init(aw);
+	if (ret) {
+		dev_err(aw->dev, "delayed re-init failed: %d\n", ret);
+		return;
+	}
+
+	if (aw->bl_dev)
+		aw99706_update_brightness(aw,
+			backlight_get_brightness(aw->bl_dev));
+}
+
+/*
+ * Dual-IC panels: both ICs share one HWEN line which only the master can
+ * drive.  The slave relies on the delayed re-init work above instead of
+ * waiting for the master here.
+ */
 static int aw99706_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
@@ -396,10 +523,27 @@ static int aw99706_probe(struct i2c_client *client)
 
 	aw99706_dt_parse(aw, &props);
 
+	aw->slave = aw99706_get_slave(dev);
+	if (aw->slave) {
+		aw->slave_regmap = devm_regmap_init_i2c(aw->slave,
+						       &aw99706_regmap_config);
+		if (IS_ERR(aw->slave_regmap)) {
+			dev_warn(dev, "no regmap for slave IC, ignoring\n");
+			aw->slave_regmap = NULL;
+		}
+	}
+
 	aw->hwen_gpio = devm_gpiod_get(aw->dev, "enable", GPIOD_OUT_LOW);
-	if (IS_ERR(aw->hwen_gpio))
-		return dev_err_probe(dev, PTR_ERR(aw->hwen_gpio),
-				     "Failed to get enable gpio\n");
+	if (IS_ERR(aw->hwen_gpio)) {
+		/* Dual-IC panels share one HWEN line: the slave node has no
+		 * enable gpio of its own. */
+		if (PTR_ERR(aw->hwen_gpio) == -ENOENT) {
+			aw->hwen_gpio = NULL;
+		} else {
+			return dev_err_probe(dev, PTR_ERR(aw->hwen_gpio),
+					     "Failed to get enable gpio\n");
+		}
+	}
 
 	ret = aw99706_hw_init(aw);
 	if (ret < 0)
@@ -409,13 +553,25 @@ static int aw99706_probe(struct i2c_client *client)
 	props.type = BACKLIGHT_RAW;
 	props.scale = BACKLIGHT_SCALE_LINEAR;
 
-	bl_dev = devm_backlight_device_register(dev, "aw99706-backlight", dev,
-						aw, &aw99706_bl_ops, &props);
+	/* Dual-IC panels expose two instances; keep the names unique. */
+	{
+		char bl_name[32];
+
+		snprintf(bl_name, sizeof(bl_name), "aw99706-backlight-%s",
+			 dev_name(dev));
+		bl_dev = devm_backlight_device_register(dev, bl_name, dev,
+							aw, &aw99706_bl_ops, &props);
+	}
 	if (IS_ERR(bl_dev))
 		return dev_err_probe(dev, PTR_ERR(bl_dev),
 				     "Failed to register backlight!\n");
 
 	aw->bl_dev = bl_dev;
+
+	if (!aw->hwen_gpio) {
+		INIT_DELAYED_WORK(&aw->reinit_work, aw99706_reinit_work);
+		schedule_delayed_work(&aw->reinit_work, msecs_to_jiffies(200));
+	}
 
 	return 0;
 }
@@ -424,11 +580,14 @@ static void aw99706_remove(struct i2c_client *client)
 {
 	struct aw99706_device *aw = i2c_get_clientdata(client);
 
+	cancel_delayed_work_sync(&aw->reinit_work);
+
 	aw99706_update_brightness(aw, 0);
 
 	msleep(50);
 
-	gpiod_set_value_cansleep(aw->hwen_gpio, 0);
+	if (aw->hwen_gpio)
+		gpiod_set_value_cansleep(aw->hwen_gpio, 0);
 }
 
 static int aw99706_suspend(struct device *dev)

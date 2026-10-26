@@ -253,7 +253,10 @@ static int pmic_glink_rpmsg_probe(struct rpmsg_device *rpdev)
 		return dev_err_probe(&rpdev->dev, -ENODEV, "no pmic_glink device to attach to\n");
 
 	dev_set_drvdata(&rpdev->dev, pg);
-	pg->pdr_available = rpdev->id.driver_data;
+	/* DIAG: the ADSP was started by the bootloader before this kernel, so the
+	 * servreg/PDR "msm/adsp/charger_pd" notification is never observed.  Force
+	 * the no-PDR path so clients come up immediately. */
+	pg->pdr_available = false;
 
 	guard(mutex)(&pg->state_lock);
 	pg->ept = rpdev->ept;

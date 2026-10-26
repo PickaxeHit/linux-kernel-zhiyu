@@ -3,6 +3,10 @@
 #ifndef __Q6PRM_H__
 #define __Q6PRM_H__
 
+/* Clock IDs used by the LPAIF DAI set_sysclk() calls */
+#define LPAIF_MI2S_MCLK 1
+#define LPAIF_MI2S_BCLK 2
+
 /* Clock ID for Primary I2S IBIT */
 #define Q6PRM_LPASS_CLK_ID_PRI_MI2S_IBIT                          0x100
 /* Clock ID for Primary I2S EBIT */
@@ -51,6 +55,23 @@
 
 /* Clock ID for QUINARY MI2S OSR CLK  */
 #define Q6PRM_LPASS_CLK_ID_QUI_MI2S_OSR                         0x116
+
+/*
+ * Clock IDs for the LPAIF PCM/TDM interfaces.  The AudioReach TDM endpoint
+ * does not run until the AP has voted for its bit clock through the PRM
+ * service, so these must be reachable from <&q6prmcc> in the device tree.
+ */
+#define Q6PRM_LPASS_CLK_ID_PRI_TDM_IBIT				0x200
+#define Q6PRM_LPASS_CLK_ID_PRI_TDM_EBIT				0x201
+#define Q6PRM_LPASS_CLK_ID_SEC_TDM_IBIT				0x202
+#define Q6PRM_LPASS_CLK_ID_SEC_TDM_EBIT				0x203
+#define Q6PRM_LPASS_CLK_ID_TER_TDM_IBIT				0x204
+#define Q6PRM_LPASS_CLK_ID_TER_TDM_EBIT				0x205
+#define Q6PRM_LPASS_CLK_ID_QUAD_TDM_IBIT			0x206
+#define Q6PRM_LPASS_CLK_ID_QUAD_TDM_EBIT			0x207
+#define Q6PRM_LPASS_CLK_ID_QUIN_TDM_IBIT			0x208
+#define Q6PRM_LPASS_CLK_ID_QUIN_TDM_EBIT			0x209
+#define Q6PRM_LPASS_CLK_ID_QUIN_TDM_OSR				0x20A
 
 #define Q6PRM_LPASS_CLK_ID_WSA_CORE_MCLK			0x305
 #define Q6PRM_LPASS_CLK_ID_WSA_CORE_NPL_MCLK			0x306

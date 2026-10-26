@@ -166,6 +166,7 @@ struct msm_dsi_host {
 
 	struct drm_display_mode *mode;
 	struct drm_dsc_config *dsc;
+	unsigned int dsc_slice_per_pkt;
 
 	/* connected device info */
 	unsigned int channel;
@@ -353,6 +354,7 @@ static int dsi_clk_init(struct msm_dsi_host *msm_host)
 
 int msm_dsi_runtime_suspend(struct device *dev)
 {
+	pr_debug("[SUSP] dsi_runtime_suspend\n");
 	struct platform_device *pdev = to_platform_device(dev);
 	struct msm_dsi *msm_dsi = platform_get_drvdata(pdev);
 	struct mipi_dsi_host *host = msm_dsi->host;
@@ -368,6 +370,7 @@ int msm_dsi_runtime_suspend(struct device *dev)
 
 int msm_dsi_runtime_resume(struct device *dev)
 {
+	pr_debug("[SUSP] dsi_runtime_resume\n");
 	struct platform_device *pdev = to_platform_device(dev);
 	struct msm_dsi *msm_dsi = platform_get_drvdata(pdev);
 	struct mipi_dsi_host *host = msm_dsi->host;
@@ -952,17 +955,10 @@ static void dsi_update_dsc_timing(struct msm_dsi_host *msm_host, bool is_cmd_mod
 	slice_per_intf = dsc->slice_count;
 
 	total_bytes_per_intf = dsc->slice_chunk_size * slice_per_intf;
-	bytes_per_pkt = dsc->slice_chunk_size; /* * slice_per_pkt; */
+	bytes_per_pkt = dsc->slice_chunk_size * msm_host->dsc_slice_per_pkt;
 
 	eol_byte_num = total_bytes_per_intf % 3;
-
-	/*
-	 * Typically, pkt_per_line = slice_per_intf * slice_per_pkt.
-	 *
-	 * Since the current driver only supports slice_per_pkt = 1,
-	 * pkt_per_line will be equal to slice per intf for now.
-	 */
-	pkt_per_line = slice_per_intf;
+	pkt_per_line = slice_per_intf / msm_host->dsc_slice_per_pkt;
 
 	if (is_cmd_mode) /* packet data type */
 		reg = DSI_COMMAND_COMPRESSION_MODE_CTRL_STREAM0_DATATYPE(MIPI_DSI_DCS_LONG_WRITE);
@@ -1118,12 +1114,8 @@ static void dsi_timing_setup(struct msm_dsi_host *msm_host, bool is_bonded_dsi)
 		else
 			/*
 			 * When DSC is enabled, WC = slice_chunk_size * slice_per_pkt + 1.
-			 * Currently, the driver only supports default value of slice_per_pkt = 1
-			 *
-			 * TODO: Expand mipi_dsi_device struct to hold slice_per_pkt info
-			 *       and adjust DSC math to account for slice_per_pkt.
 			 */
-			wc = msm_host->dsc->slice_chunk_size + 1;
+			wc = msm_host->dsc->slice_chunk_size * msm_host->dsc_slice_per_pkt + 1;
 
 		dsi_write(msm_host, REG_DSI_CMD_MDP_STREAM0_CTRL,
 			DSI_CMD_MDP_STREAM0_CTRL_WORD_COUNT(wc) |
@@ -1466,14 +1458,82 @@ static int dsi_cmd_dma_tx(struct msm_dsi_host *msm_host, int len)
 
 	dsi_wait4video_eng_busy(msm_host);
 
+	pr_debug("[CMD] dsi%d tx len=%d ctrl=%#x status0=%#x clk=%#x intr=%#x\n",
+		msm_host->id, len,
+		dsi_read(msm_host, REG_DSI_CTRL),
+		dsi_read(msm_host, REG_DSI_STATUS0),
+		dsi_read(msm_host, REG_DSI_CLK_CTRL),
+		dsi_read(msm_host, REG_DSI_INTR_CTRL));
+	pr_debug_ratelimited("[CMD] dsi%d tx pre: clk_status=%#x dma_ctrl=%#x ack_err=%#x timeout=%#x\n",
+		msm_host->id,
+		dsi_read(msm_host, REG_DSI_CLK_STATUS),
+		dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL),
+		dsi_read(msm_host, REG_DSI_ACK_ERR_STATUS),
+		dsi_read(msm_host, REG_DSI_TIMEOUT_STATUS));
 	triggered = msm_dsi_manager_cmd_xfer_trigger(
 						msm_host->id, dma_base, len);
 	if (triggered) {
 		ret = wait_for_completion_timeout(&msm_host->dma_comp,
 					msecs_to_jiffies(200));
 		DBG("ret=%d", ret);
-		if (ret == 0)
+		if (ret == 0) {
+			pr_info("[CMD] dsi%d TIMEOUT ctrl=%#x status0=%#x fifo=%#x intr=%#x\n",
+				msm_host->id,
+				dsi_read(msm_host, REG_DSI_CTRL),
+				dsi_read(msm_host, REG_DSI_STATUS0),
+				dsi_read(msm_host, REG_DSI_FIFO_STATUS),
+				dsi_read(msm_host, REG_DSI_INTR_CTRL));
+			pr_info("[CMD] dsi%d TIMEOUT dma_base=%#x dma_len=%#x dma_ctrl=%#x trig=%#x\n",
+				msm_host->id,
+				dsi_read(msm_host, REG_DSI_DMA_BASE),
+				dsi_read(msm_host, REG_DSI_DMA_LEN),
+				dsi_read(msm_host, REG_DSI_CMD_DMA_CTRL),
+				dsi_read(msm_host, REG_DSI_TRIG_DMA));
+			pr_info("[CMD] dsi%d TIMEOUT clk_status=%#x reset=%#x clk_ctrl=%#x\n",
+				msm_host->id,
+				dsi_read(msm_host, REG_DSI_CLK_STATUS),
+				dsi_read(msm_host, REG_DSI_RESET),
+				dsi_read(msm_host, REG_DSI_CLK_CTRL));
+			pr_info("[CMD] dsi%d TIMEOUT ack_err=%#x timeout=%#x phyerr=%#x err_mask=%#x\n",
+				msm_host->id,
+				dsi_read(msm_host, REG_DSI_ACK_ERR_STATUS),
+				dsi_read(msm_host, REG_DSI_TIMEOUT_STATUS),
+				dsi_read(msm_host, REG_DSI_DLN0_PHY_ERR),
+				dsi_read(msm_host, REG_DSI_ERR_INT_MASK0));
+
+			/*
+			 * DIAGNOSTIC: watch how long the command engine keeps
+			 * reporting busy after the transfer timed out.  When it
+			 * clears, print the elapsed time -- correlating that with
+			 * the timestamped resume callbacks identifies what the
+			 * engine was actually waiting for.
+			 */
+			{
+				ktime_t t0 = ktime_get();
+				u32 st;
+				int n;
+
+				for (n = 0; n < 400; n++) {
+					st = dsi_read(msm_host, REG_DSI_STATUS0);
+					if (!(st & (DSI_STATUS0_CMD_MODE_ENGINE_BUSY |
+						    DSI_STATUS0_CMD_MODE_DMA_BUSY))) {
+						pr_info("[CMD] dsi%d engine CLEARED after %us (status0=%#x fifo=%#x intr=%#x clk=%#x)\n",
+							msm_host->id,
+							(u32)(ktime_us_delta(ktime_get(), t0) / 1000),
+							st,
+							dsi_read(msm_host, REG_DSI_FIFO_STATUS),
+							dsi_read(msm_host, REG_DSI_INTR_CTRL),
+							dsi_read(msm_host, REG_DSI_CLK_STATUS));
+						break;
+					}
+					usleep_range(5000, 6000);
+				}
+				if (n == 400)
+					pr_info("[CMD] dsi%d engine STILL BUSY after 2s (status0=%#x)\n",
+						msm_host->id, st);
+			}
 			ret = -ETIMEDOUT;
+		}
 		else
 			ret = len;
 	} else {
@@ -1589,8 +1649,14 @@ static void dsi_err_worker(struct work_struct *work)
 	/* It is safe to clear here because error irq is disabled. */
 	msm_host->err_work_state = 0;
 
-	/* enable dsi error interrupt */
-	dsi_intr_ctrl(msm_host, DSI_IRQ_MASK_ERROR, 1);
+	/*
+	 * DEBUG: do not re-enable the error interrupt, otherwise a latched
+	 * hardware error floods the console (~25k lines/s) and buries the
+	 * sequence we are trying to observe.  The interrupt is re-armed by the
+	 * next host enable.
+	 */
+	pr_info("dsi%d: error irq left disabled (storm suppressed)\n",
+		msm_host->id);
 }
 
 static void dsi_ack_err_status(struct msm_dsi_host *msm_host)
@@ -1643,6 +1709,7 @@ static void dsi_fifo_status(struct msm_dsi_host *msm_host)
 
 	/* fifo underflow, overflow */
 	if (status) {
+		pr_info_ratelimited("dsi%d: fifo status %#x\n", msm_host->id, status);
 		dsi_write(msm_host, REG_DSI_FIFO_STATUS, status);
 		msm_host->err_work_state |= DSI_ERR_STATE_FIFO;
 		if (status & DSI_FIFO_STATUS_CMD_MDP_FIFO_UNDERFLOW)
@@ -1732,8 +1799,13 @@ static int dsi_host_attach(struct mipi_dsi_host *host,
 	msm_host->lanes = dsi->lanes;
 	msm_host->format = dsi->format;
 	msm_host->mode_flags = dsi->mode_flags;
-	if (dsi->dsc)
+	if (dsi->dsc) {
 		msm_host->dsc = dsi->dsc;
+		if (dsi->mode_flags & MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT)
+			msm_host->dsc_slice_per_pkt = dsi->dsc->slice_count;
+		else
+			msm_host->dsc_slice_per_pkt = 1;
+	}
 
 	if (msm_host->format == MIPI_DSI_FMT_RGB101010) {
 		if (!msm_dsi_host_version_geq(msm_host, MSM_DSI_VER_MAJOR_6G,
@@ -1913,10 +1985,28 @@ static int dsi_populate_dsc_params(struct msm_dsi_host *msm_host, struct drm_dsc
 	drm_dsc_set_const_params(dsc);
 	drm_dsc_set_rc_buf_thresh(dsc);
 
-	/* DPU supports only pre-SCR panels */
-	ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_1_PRE_SCR);
+	if (dsc->dsc_version_major != 1) {
+		DRM_DEV_ERROR(&msm_host->pdev->dev,
+			      "Unsupported DSC version: %x.%x\n",
+			      dsc->dsc_version_major, dsc->dsc_version_minor);
+		return -EOPNOTSUPP;
+	}
+
+	switch (dsc->dsc_version_minor) {
+	case 1:
+		ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_1_PRE_SCR);
+		break;
+	case 2:
+		ret = drm_dsc_setup_rc_params(dsc, DRM_DSC_1_2_444);
+		break;
+	default:
+		ret = -EOPNOTSUPP;
+	}
+
 	if (ret) {
-		DRM_DEV_ERROR(&msm_host->pdev->dev, "could not find DSC RC parameters\n");
+		DRM_DEV_ERROR(&msm_host->pdev->dev,
+			      "could not find DSC RC parameters for DSC version: %x.%x\n",
+			      dsc->dsc_version_major, dsc->dsc_version_minor);
 		return ret;
 	}
 
@@ -2441,6 +2531,8 @@ void msm_dsi_host_disable_irq(struct mipi_dsi_host *host)
 
 int msm_dsi_host_enable(struct mipi_dsi_host *host)
 {
+	pr_debug("[HOST] msm_dsi_host_enable id=%d\n",
+		to_msm_dsi_host(host)->id);
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 
 	dsi_op_mode_config(msm_host,
@@ -2459,13 +2551,51 @@ int msm_dsi_host_enable(struct mipi_dsi_host *host)
 	return 0;
 }
 
+/*
+ * Vendor sequence (dsi_ctrl_hw_cmn_vid_engine_busy): after the video engine is
+ * told to stop, poll DSI_STATUS0 VIDEO_MODE_ENGINE_BUSY for up to 50 ms and let
+ * the current frame drain.  Resetting the controller while the engine is still
+ * busy latches the FIFO/timeout error bits and the link never recovers.
+ */
+static bool dsi_wait4vid_engine_idle(struct msm_dsi_host *msm_host)
+{
+	ktime_t start = ktime_get();
+	u32 status;
+
+	do {
+		status = dsi_read(msm_host, REG_DSI_STATUS0);
+		if (!(status & DSI_STATUS0_VIDEO_MODE_ENGINE_BUSY))
+			return true;
+		usleep_range(250, 1000);
+	} while (ktime_ms_delta(ktime_get(), start) < 50);
+
+	return false;
+}
+
 int msm_dsi_host_disable(struct mipi_dsi_host *host)
 {
+	pr_debug("[HOST] msm_dsi_host_disable id=%d\n",
+		to_msm_dsi_host(host)->id);
 	struct msm_dsi_host *msm_host = to_msm_dsi_host(host);
 
+	bool video = !!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO);
+
 	msm_host->enabled = false;
-	dsi_op_mode_config(msm_host,
-		!!(msm_host->mode_flags & MIPI_DSI_MODE_VIDEO), false);
+
+	/*
+	 * Drop only the video-mode bit first and wait for the engine to drain
+	 * (vendor order), then disable and reset the controller.
+	 */
+	if (video) {
+		u32 ctrl = dsi_read(msm_host, REG_DSI_CTRL);
+
+		dsi_write(msm_host, REG_DSI_CTRL, ctrl & ~DSI_CTRL_VID_MODE_EN);
+		if (!dsi_wait4vid_engine_idle(msm_host))
+			DRM_DEV_DEBUG_DRIVER(&msm_host->pdev->dev,
+					     "video engine still busy after 50ms\n");
+	}
+
+	dsi_op_mode_config(msm_host, video, false);
 
 	/* Since we have disabled INTF, the video engine won't stop so that
 	 * the cmd engine will be blocked.
@@ -2498,6 +2628,8 @@ int msm_dsi_host_power_on(struct mipi_dsi_host *host,
 	const struct msm_dsi_cfg_handler *cfg_hnd = msm_host->cfg_hnd;
 	int ret = 0;
 
+	pr_debug("[EN] dsi_host_power_on id=%d (already=%d)\n", msm_host->id,
+		msm_host->power_on);
 	mutex_lock(&msm_host->dev_mutex);
 	if (msm_host->power_on) {
 		DBG("dsi host already on");

@@ -691,6 +691,18 @@ config SND_SOC_AW88166
 	  digital Smart K audio amplifier with sound quality
 	  enhancement algorithms and speaker protection.
 
+config SND_SOC_AW882XX
+	tristate "Awinic AW882xx smart PA (vendor driver)"
+	depends on I2C
+	select GPIOLIB
+	select REGMAP_I2C
+	select CRC32
+	help
+	  Vendor Awinic AW882xx smart speaker amplifier driver as shipped in
+	  Android kernels.  Unlike the mainline aw88261/aw88395 drivers it
+	  understands ACF v1 calibration files (aw882xx_acf.bin), which is
+	  what the Lenovo TB378FC (SM8750) firmware ships.
+
 config SND_SOC_AW88261
 	tristate "Soc Audio for awinic aw88261"
 	depends on I2C

@@ -50,7 +50,16 @@
 #define CTL_MIXER_BORDER_OUT            BIT(24)
 #define CTL_FLUSH_MASK_CTL              BIT(17)
 
+/*
+ * 厂商驱动（msm_drm.ko）对这两类复位用了不同的超时：
+ *   sde_hw_ctl_reset_control      → 2 ms   （SW 主动发起，结束很快）
+ *   sde_hw_ctl_wait_reset_status  → 100 ms （等待 hw 自发复位完成，可能很慢）
+ * 反汇编常量分别为 -2,000,000 ns 与 -100,000,000 ns。
+ * mainline 两者都用 2 ms，导致 MDSS 掉电-上电后 hw 自发复位尚未完成就被判为
+ * 失败，进而注销 VSYNC 回调、永久黑屏。
+ */
 #define DPU_REG_RESET_TIMEOUT_US        2000
+#define DPU_REG_RESET_WAIT_TIMEOUT_US   100000
 #define  MERGE_3D_IDX   23
 #define  DSC_IDX        22
 #define CDM_IDX         26
@@ -118,7 +127,6 @@ static inline void dpu_hw_ctl_clear_pending_flush(struct dpu_hw_ctl *ctx)
 	ctx->pending_intf_flush_mask = 0;
 	ctx->pending_wb_flush_mask = 0;
 	ctx->pending_cwb_flush_mask = 0;
-	ctx->pending_periph_flush_mask = 0;
 	ctx->pending_merge_3d_flush_mask = 0;
 	ctx->pending_dsc_flush_mask = 0;
 	ctx->pending_cdm_flush_mask = 0;
@@ -455,7 +463,7 @@ static int dpu_hw_ctl_wait_reset_status(struct dpu_hw_ctl *ctx)
 		return 0;
 
 	pr_debug("hw ctl reset is set for ctl:%d\n", ctx->idx);
-	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_TIMEOUT_US)) {
+	if (dpu_hw_ctl_poll_reset_status(ctx, DPU_REG_RESET_WAIT_TIMEOUT_US)) {
 		pr_err("hw recovery is not complete for ctl:%d\n", ctx->idx);
 		return -EINVAL;
 	}

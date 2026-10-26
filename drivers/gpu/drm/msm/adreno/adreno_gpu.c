@@ -382,9 +382,12 @@ int adreno_get_param(struct msm_gpu *gpu, struct msm_context *ctx,
 			*value = 0x100000;
 		return 0;
 	case MSM_PARAM_CHIP_ID:
+		/*
+		 * Do not pack the speedbin into the upper 32 bits: Mesa's
+		 * freedreno matches the plain 32-bit chip id and rejects the
+		 * composed value (0xe8_44050001) as an unknown GPU.
+		 */
 		*value = adreno_gpu->chip_id;
-		if (!adreno_gpu->info->revn)
-			*value |= ((uint64_t) adreno_gpu->speedbin) << 32;
 		return 0;
 	case MSM_PARAM_MAX_FREQ:
 		*value = adreno_gpu->base.fast_rate;
@@ -1251,8 +1254,6 @@ void adreno_gpu_cleanup(struct adreno_gpu *adreno_gpu)
 
 	for (i = 0; i < ARRAY_SIZE(adreno_gpu->info->fw); i++)
 		release_firmware(adreno_gpu->fw[i]);
-
-	pm_runtime_dont_use_autosuspend(&gpu->pdev->dev);
 
 	if (priv && pm_runtime_enabled(&priv->gpu_pdev->dev))
 		pm_runtime_disable(&priv->gpu_pdev->dev);

@@ -22,6 +22,7 @@ struct q6apm_graph;
 #define MODULE_ID_PLACEHOLDER_DECODER	0x07001009
 #define MODULE_ID_I2S_SINK		0x0700100A
 #define MODULE_ID_I2S_SOURCE		0x0700100B
+#define MODULE_ID_TDM_SINK		0x0700100E
 #define MODULE_ID_SAL			0x07001010
 #define MODULE_ID_MFC			0x07001015
 #define MODULE_ID_DATA_LOGGING		0x0700101A
@@ -59,6 +60,7 @@ struct q6apm_graph;
 #define APM_CMD_GRAPH_CLOSE			0x01001004
 #define APM_CMD_GRAPH_FLUSH			0x01001005
 #define APM_CMD_SET_CFG				0x01001006
+int q6apm_get_module_cfg(struct q6apm_graph *graph, u32 iid, u32 param_id);
 #define APM_CMD_GET_CFG				0x01001007
 #define APM_CMD_SHARED_MEM_MAP_REGIONS		0x0100100C
 #define APM_CMD_SHARED_MEM_UNMAP_REGIONS	0x0100100D
@@ -522,6 +524,90 @@ struct apm_cont_prop_id_domain  {
 #define CONFIG_I2S_WS_SRC_EXTERNAL		0x0
 #define CONFIG_I2S_WS_SRC_INTERNAL		0x1
 
+/*
+ * AudioReach interface config for TDM (and "audio if") endpoints.  Android's
+ * resource manager sends this for TDM-LPAIF-RX-SECONDARY when the speaker is
+ * opened; without it the LPASS never starts the TDM port and produces no clock.
+ */
+#define PARAM_ID_AUDIO_IF_INTF_CFG		0x0800113c
+struct param_id_audio_if_intf_cfg {
+	uint32_t qaif_type;
+	uint16_t intf_idx;
+	uint16_t intf_mode;
+	uint16_t ctrl_data_out_enable;
+	uint16_t active_slot_mask;
+	uint16_t nslots_per_frame;
+	uint16_t slot_width;
+	uint16_t active_lane_mask;
+	uint16_t frame_sync_rate;
+	uint16_t frame_sync_src;
+	uint16_t frame_sync_mode;
+	uint16_t invert_frame_sync_pulse;
+	uint16_t frame_sync_data_delay;
+	uint16_t bit_clk_type;
+	uint16_t inv_int_bit_clk;
+} __packed;
+
+/* LPAIF TDM interface configuration (Linux-MSM audioreach/tokens.m4 ABI) */
+#define PARAM_ID_HW_INTF_CLK_CFG		0x0800113C
+
+/* Interface clock selection; all-zero asks the firmware for its defaults. */
+struct param_id_hw_intf_clk_cfg {
+	uint32_t clock_id;
+	uint32_t clock_freq;
+	uint32_t clock_attri;
+	uint32_t clock_root;
+} __packed;
+
+#define PARAM_ID_TDM_LANE_CFG			0x0800106A
+
+/* Selects which TDM data lines (lanes) the endpoint drives/samples.
+ * Android does not send this, but the stock firmware accepts it and the
+ * erhai mainline port always sends it; without it the DSP leaves the data
+ * line undriven while sck/ws still toggle.
+ */
+#define TDM_LANE_MASK_LANE0			0x1
+#define TDM_LANE_MASK_LANE1			0x2
+
+struct param_id_tdm_lane_cfg {
+	/* Vendor ABI, see pcm_tdm_api.h (sm8750 audio/graphservices):
+	 *   struct param_id_tdm_lane_cfg_t { uint16_t lane_mask;
+	 *                                    uint16_t reserved; };
+	 * A 32-bit lane_mask here makes the firmware accept the SET_CFG but
+	 * leaves the endpoint in a state where APM_CMD_GRAPH_START fails with
+	 * status 1.
+	 */
+	uint16_t lane_mask;
+	uint16_t reserved;
+} __packed;
+
+struct apm_tdm_module_lane_cfg {
+	struct apm_module_param_data param_data;
+	struct param_id_tdm_lane_cfg cfg;
+} __packed;
+
+#define PARAM_ID_TDM_INTF_CFG			0x0800101B
+struct param_id_tdm_intf_cfg {
+	uint32_t lpaif_type;
+	uint32_t intf_idx;
+	uint16_t sync_src;
+	uint16_t ctrl_data_out_enable;
+	uint32_t slot_mask;
+	uint16_t nslots_per_frame;
+	uint16_t slot_width;
+	uint16_t sync_mode;
+	uint16_t ctrl_invert_sync_pulse;
+	uint16_t ctrl_sync_data_delay;
+	uint16_t reserved;
+} __packed;
+
+struct apm_tdm_module_intf_cfg {
+	struct apm_module_param_data param_data;
+	struct param_id_tdm_intf_cfg cfg;
+} __packed;
+
+#define APM_TDM_INTF_CFG_PSIZE	ALIGN(sizeof(struct apm_tdm_module_intf_cfg), 8)
+
 #define PARAM_ID_I2S_INTF_CFG			0x08001019
 struct param_id_i2s_intf_cfg {
 	uint32_t lpaif_type;
@@ -658,6 +744,7 @@ struct param_id_sal_limiter_enable {
 } __packed;
 
 #define PARAM_ID_MFC_OUTPUT_MEDIA_FORMAT	0x08001024
+#define PARAM_ID_CHMIXER_COEFF			0x0800101f
 #define PARAM_ID_EARLY_EOS_DELAY		0x0800114C
 #define EARLY_EOS_DELAY_MS			150
 
@@ -877,6 +964,24 @@ struct audioreach_module {
 	uint32_t data_format;
 	uint32_t hw_interface_type;
 
+	/* TDM endpoint (MODULE_ID_TDM_SINK) */
+	uint32_t sync_src;
+	uint32_t slot_mask;
+	uint32_t sync_mode;
+	uint32_t qaif_type;
+	uint32_t intf_mode;
+	uint32_t ctrl_data_out_enable;
+	uint32_t active_slot_mask;
+	uint32_t nslots_per_frame;
+	uint32_t slot_width;
+	uint32_t active_lane_mask;
+	uint32_t frame_sync_rate;
+	uint32_t frame_sync_src;
+	uint32_t frame_sync_mode;
+	uint32_t ctrl_invert_sync_pulse;
+	uint32_t ctrl_sync_data_delay;
+	uint32_t bit_clk_type;
+
 	/* PCM module specific */
 	uint32_t interleave_type;
 
@@ -906,6 +1011,9 @@ struct audioreach_module_config {
 	u16	dp_idx;
 	u32	channel_allocation;
 	u32	sd_line_mask;
+	u32	slot_mask;
+	u16	nslots_per_frame;
+	u16	slot_width;
 	int	fmt;
 	struct snd_codec codec;
 	u8 channel_map[AR_PCM_MAX_NUM_CHANNEL];
@@ -935,6 +1043,10 @@ int audioreach_send_cmd_sync(struct device *dev, gpr_device_t *gdev, struct gpr_
 			     const struct gpr_pkt *pkt, uint32_t rsp_opcode);
 int audioreach_graph_send_cmd_sync(struct q6apm_graph *graph, const struct gpr_pkt *pkt,
 				   uint32_t rsp_opcode);
+int audioreach_mfc_set_chmixer_coeff(struct q6apm_graph *graph,
+				     struct audioreach_module *module,
+				     unsigned int rotation);
+
 int audioreach_set_media_format(struct q6apm_graph *graph,
 				const struct audioreach_module *module,
 				const struct audioreach_module_config *cfg);

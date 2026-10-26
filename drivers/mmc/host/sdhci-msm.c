@@ -7,6 +7,7 @@
 
 #include <linux/module.h>
 #include <linux/delay.h>
+#include <linux/mmc/host.h>
 #include <linux/mmc/mmc.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_opp.h>
@@ -164,6 +165,9 @@
 #define DISABLE_CRYPTO			BIT(15)
 #define CRYPTO_GENERAL_ENABLE		BIT(1)
 #define HC_VENDOR_SPECIFIC_FUNC4	0x260
+/* Take the feedback clock from the pad instead of the internal loopback;
+ * stock sdhci-msm does this in sdhci_enable_ext_fb_clk(). */
+#define EXT_FB_CLK			BIT(24)
 
 #define ICE_HCI_PARAM_CCI	GENMASK(7, 0)
 #define ICE_HCI_PARAM_CE	GENMASK(8, 8)
@@ -293,6 +297,8 @@ struct sdhci_msm_host {
 	bool use_14lpp_dll_reset;
 	bool tuning_done;
 	bool calibration_done;
+	bool ext_fb_clk;	/* feedback clock comes from the pad (level shifter) */
+	bool ext_fb_clk_done;
 	u8 saved_tuning_phase;
 	bool use_cdclp533;
 	u32 curr_pwr_state;
@@ -310,6 +316,10 @@ struct sdhci_msm_host {
 	bool uses_tassadar_dll;
 	u32 dll_config;
 	u32 ddr_config;
+	/* qcom,dll-hsr-list: board DLL table, as used by the stock driver */
+	bool dll_hsr;
+	u32 dll_hsr_config_3;
+	u32 dll_hsr_usr_ctl;
 	bool vqmmc_enabled;
 	bool non_cqe_ice_init_done;
 };
@@ -755,20 +765,43 @@ static int msm_init_cm_dll(struct sdhci_host *host)
 	 * This setting is applicable to SDCC v5.1 onwards only.
 	 */
 	if (msm_host->uses_tassadar_dll) {
-		config = DLL_USR_CTL_POR_VAL | FINE_TUNE_MODE_EN |
-			ENABLE_DLL_LOCK_STATUS | BIAS_OK_SIGNAL;
-		writel_relaxed(config, host->ioaddr +
-				msm_offset->core_dll_usr_ctl);
+		if (msm_host->dll_hsr) {
+			/*
+			 * Boards behind a level shifter need their own DLL values
+			 * (qcom,dll-hsr-list) instead of the computed defaults:
+			 * a wrong DLL/feedback path makes the first card init
+			 * fail, or succeed only intermittently.
+			 */
+			dev_dbg(mmc_dev(mmc),
+				 "dll hsr list applied: config_3 low byte 0x%02x, usr_ctl 0x%08x\n",
+				 msm_host->dll_hsr_config_3 & 0xFF,
+				 msm_host->dll_hsr_usr_ctl);
 
-		config = readl_relaxed(host->ioaddr +
+			writel_relaxed(msm_host->dll_hsr_usr_ctl,
+				       host->ioaddr + msm_offset->core_dll_usr_ctl);
+
+			config = readl_relaxed(host->ioaddr +
+					msm_offset->core_dll_config_3);
+			config &= ~0xFF;
+			config |= msm_host->dll_hsr_config_3 & 0xFF;
+			writel_relaxed(config, host->ioaddr +
+					msm_offset->core_dll_config_3);
+		} else {
+			config = DLL_USR_CTL_POR_VAL | FINE_TUNE_MODE_EN |
+				ENABLE_DLL_LOCK_STATUS | BIAS_OK_SIGNAL;
+			writel_relaxed(config, host->ioaddr +
+					msm_offset->core_dll_usr_ctl);
+
+			config = readl_relaxed(host->ioaddr +
+					msm_offset->core_dll_config_3);
+			config &= ~0xFF;
+			if (msm_host->clk_rate < 150000000)
+				config |= DLL_CONFIG_3_LOW_FREQ_VAL;
+			else
+				config |= DLL_CONFIG_3_HIGH_FREQ_VAL;
+			writel_relaxed(config, host->ioaddr +
 				msm_offset->core_dll_config_3);
-		config &= ~0xFF;
-		if (msm_host->clk_rate < 150000000)
-			config |= DLL_CONFIG_3_LOW_FREQ_VAL;
-		else
-			config |= DLL_CONFIG_3_HIGH_FREQ_VAL;
-		writel_relaxed(config, host->ioaddr +
-			msm_offset->core_dll_config_3);
+		}
 	}
 
 	config = readl_relaxed(host->ioaddr +
@@ -1874,8 +1907,41 @@ static void __sdhci_msm_set_clock(struct sdhci_host *host, unsigned int clock)
 }
 
 /* sdhci_msm_set_clock - Called with (host->lock) spinlock held. */
+/*
+ * Boards whose slot sits behind a level shifter must feed the feedback clock
+ * from the pad (stock: qcom,external-fb-clk -> sdhci_enable_ext_fb_clk()).
+ * With the internal loopback the first card init fails, or only succeeds
+ * intermittently, which is exactly what this board showed.
+ */
+static void sdhci_msm_enable_ext_fb_clk(struct sdhci_host *host)
+{
+	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
+	struct sdhci_msm_host *msm_host = sdhci_pltfm_priv(pltfm_host);
+	u32 config;
+
+	if (!msm_host->ext_fb_clk || msm_host->ext_fb_clk_done)
+		return;
+
+	config = sdhci_readl(host, HC_VENDOR_SPECIFIC_FUNC4);
+	sdhci_writel(host, config | EXT_FB_CLK, HC_VENDOR_SPECIFIC_FUNC4);
+	msm_host->ext_fb_clk_done = true;
+
+	dev_dbg(&msm_host->pdev->dev,
+		 "external feedback clock enabled (FUNC4 0x%08lx)\n",
+		 (unsigned long)(config | EXT_FB_CLK));
+}
+
+/*
+ * The slot sits behind a level shifter: card detect is not usable yet when
+ * mmc_add_host() runs its first rescan (the core never even attempts an init,
+ * which is why no card is found), and with a CD GPIO there is no later level
+ * change to trigger another one.  Ask the core to look once more after the
+ * slot has settled.
+ */
+
 static void sdhci_msm_set_clock(struct sdhci_host *host, unsigned int clock)
 {
+	sdhci_msm_enable_ext_fb_clk(host);
 	struct sdhci_pltfm_host *pltfm_host = sdhci_priv(host);
 	struct sdhci_msm_host *msm_host = sdhci_pltfm_priv(pltfm_host);
 	struct mmc_ios ios = host->mmc->ios;
@@ -2599,6 +2665,27 @@ static inline void sdhci_msm_get_of_property(struct platform_device *pdev,
 
 	of_property_read_u32(node, "qcom,dll-config", &msm_host->dll_config);
 
+	/*
+	 * qcom,dll-hsr-list = <dll_config, ?, dll_config_3, dll_usr_ctl, ddr_config>,
+	 * the stock driver's board DLL table.  Entries [0] and [4] duplicate
+	 * qcom,dll-config / qcom,ddr-config, [2] is the DLL_CONFIG_3 low byte and
+	 * [3] goes to DLL_USR_CTL.
+	 */
+	if (of_property_count_elems_of_size(node, "qcom,dll-hsr-list",
+					    sizeof(u32)) == 5) {
+		u32 hsr[5];
+
+		of_property_read_u32_array(node, "qcom,dll-hsr-list", hsr,
+					   ARRAY_SIZE(hsr));
+		msm_host->dll_hsr = true;
+		msm_host->dll_hsr_config_3 = hsr[2];
+		msm_host->dll_hsr_usr_ctl = hsr[3];
+		if (!msm_host->dll_config)
+			msm_host->dll_config = hsr[0];
+	}
+
+	msm_host->ext_fb_clk = of_property_read_bool(node, "qcom,external-fb-clk");
+
 	if (of_device_is_compatible(node, "qcom,msm8916-sdhci"))
 		host->quirks2 |= SDHCI_QUIRK2_BROKEN_64_BIT_DMA;
 }
@@ -2830,6 +2917,11 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	if (core_major == 1 && core_minor >= 0x71)
 		msm_host->uses_tassadar_dll = true;
 
+	dev_dbg(&pdev->dev,
+		 "SDCC core %d.%d, tassadar_dll=%d dll_hsr=%d ext_fb_clk=%d\n",
+		 core_major, core_minor, msm_host->uses_tassadar_dll,
+		 msm_host->dll_hsr, msm_host->ext_fb_clk);
+
 	ret = sdhci_msm_register_vreg(msm_host);
 	if (ret)
 		goto clk_disable;
@@ -2890,6 +2982,28 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	if (of_property_read_bool(node, "supports-cqe"))
 		ret = sdhci_msm_cqe_add_host(host, pdev);
 	else
+		/*
+		 * Enable the slot's VMMC/VQMMC before the core's first card
+		 * detect.  Nothing else does it on this board: without power the
+		 * bus lines sit low (Present state bits 20..24 clear) and the
+		 * card never answers CMD8, so the first init always fails and the
+		 * slot only comes up after an unrelated driver re-probe.  The
+		 * vendor driver enables its "vdd"/"vdd-io" supplies the same way;
+		 * the core's later enable/disable pairs stay balanced because
+		 * regulator reference counts add up.
+		 */
+		if (IS_ERR_OR_NULL(host->mmc->supply.vmmc) &&
+		    IS_ERR_OR_NULL(host->mmc->supply.vqmmc))
+			mmc_regulator_get_supply(host->mmc);
+		ret = 0;
+		if (!IS_ERR_OR_NULL(host->mmc->supply.vmmc))
+			ret = regulator_enable(host->mmc->supply.vmmc);
+		if (!ret && !IS_ERR_OR_NULL(host->mmc->supply.vqmmc))
+			ret = regulator_enable(host->mmc->supply.vqmmc);
+		if (ret)
+			dev_warn(&pdev->dev, "failed to power the card slot: %d\n",
+				 ret);
+
 		ret = sdhci_add_host(host);
 	if (ret)
 		goto pm_runtime_disable;
@@ -3001,7 +3115,25 @@ static struct platform_driver sdhci_msm_driver = {
 	},
 };
 
-module_platform_driver(sdhci_msm_driver);
+/*
+ * Registered late on purpose: this board's SD slot can stall the probe (the
+ * level shifter in front of it needs board-specific bring-up), and a stalled
+ * device_initcall blocks everything after it -- including the display, which
+ * binds later than a plain platform driver.  Registering at late_initcall
+ * makes the panel come up first, so a stall is visible on screen instead of
+ * leaving the bootloader splash frozen.
+ */
+static int __init sdhci_msm_driver_init(void)
+{
+	return platform_driver_register(&sdhci_msm_driver);
+}
+late_initcall(sdhci_msm_driver_init);
+
+static void __exit sdhci_msm_driver_exit(void)
+{
+	platform_driver_unregister(&sdhci_msm_driver);
+}
+module_exit(sdhci_msm_driver_exit);
 
 MODULE_DESCRIPTION("Qualcomm Secure Digital Host Controller Interface driver");
 MODULE_LICENSE("GPL v2");

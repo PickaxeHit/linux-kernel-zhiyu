@@ -253,3 +253,10 @@ config SND_SOC_X1E80100
 	  Say Y or M if you want to use audio device on this SoCs.
 
 endif #SND_SOC_QCOM
+
+config SND_SOC_SM8750
+	tristate "ASoC support for SM8750"
+	depends on SND_SOC_QCOM
+	select SND_SOC_QCOM_COMMON
+	help
+	  Say Y to enable ASoC support for the Qualcomm SM8750 platform.

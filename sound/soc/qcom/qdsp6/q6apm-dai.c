@@ -93,7 +93,8 @@ static const struct snd_pcm_hardware q6apm_dai_hardware_capture = {
 				 SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
 				 SNDRV_PCM_INFO_NO_REWINDS | SNDRV_PCM_INFO_SYNC_APPLPTR |
 				 SNDRV_PCM_INFO_BATCH),
-	.formats =              (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE),
+	.formats =              (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE |
+				 SNDRV_PCM_FMTBIT_S32_LE),
 	.rates =                SNDRV_PCM_RATE_8000_48000,
 	.rate_min =             8000,
 	.rate_max =             48000,
@@ -113,7 +114,8 @@ static const struct snd_pcm_hardware q6apm_dai_hardware_playback = {
 				 SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME |
 				 SNDRV_PCM_INFO_NO_REWINDS | SNDRV_PCM_INFO_SYNC_APPLPTR |
 				 SNDRV_PCM_INFO_BATCH),
-	.formats =              (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE),
+	.formats =              (SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE |
+				 SNDRV_PCM_FMTBIT_S32_LE),
 	.rates =                SNDRV_PCM_RATE_8000_192000,
 	.rate_min =             8000,
 	.rate_max =             192000,
@@ -233,7 +235,16 @@ static int q6apm_dai_prepare(struct snd_soc_component *component,
 	cfg.direction = substream->stream;
 	cfg.sample_rate = runtime->rate;
 	cfg.num_channels = runtime->channels;
-	cfg.bit_width = prtd->bits_per_sample;
+	/*
+	 * The speaker path is 32-bit end to end (Android resource manager:
+	 * TDM-LPAIF-RX-SECONDARY, bit_width 32, S24_LE payload).  A S16_LE
+	 * userspace format would otherwise hand the DSP's PCM decoder a
+	 * 16-bit width, which it rejects outright.
+	 */
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
+		cfg.bit_width = 32;
+	else
+		cfg.bit_width = prtd->bits_per_sample;
 	cfg.fmt = SND_AUDIOCODEC_PCM;
 	audioreach_set_default_channel_mapping(cfg.channel_map, runtime->channels);
 	if (prtd->state) {
@@ -364,6 +375,10 @@ static int q6apm_dai_trigger(struct snd_soc_component *component,
 	return ret;
 }
 
+static int q6apm_dai_memory_map(struct snd_soc_component *component,
+			       struct snd_pcm_substream *substream,
+			       int graph_id, bool is_push_pull);
+
 static int q6apm_dai_open(struct snd_soc_component *component,
 			  struct snd_pcm_substream *substream)
 {
@@ -394,6 +409,18 @@ static int q6apm_dai_open(struct snd_soc_component *component,
 		dev_err(dev, "%s: Could not allocate memory\n", __func__);
 		ret = PTR_ERR(prtd->graph);
 		goto err;
+	}
+
+	/* Buffer mapping needs the graph info loaded from the topology. */
+	{
+		bool is_push_pull =
+			q6apm_is_graph_in_push_pull_mode_from_id(dev, graph_id,
+								 substream->stream);
+		ret = q6apm_dai_memory_map(component, substream, graph_id, is_push_pull);
+		if (ret) {
+			dev_err(dev, "memory map failed %d\n", ret);
+			goto err;
+		}
 	}
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
@@ -517,10 +544,18 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
 
 	switch (params_format(params)) {
 	case SNDRV_PCM_FORMAT_S16_LE:
-		prtd->bits_per_sample = 16;
+		/*
+		 * The speaker graph runs 32-bit end to end; the shared-memory
+		 * endpoint has to be told the same width or the DSP rejects
+		 * every DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER (write() -> EIO).
+		 */
+		prtd->bits_per_sample = 32;
 		break;
 	case SNDRV_PCM_FORMAT_S24_LE:
-		prtd->bits_per_sample = 24;
+		prtd->bits_per_sample = 32;
+		break;
+	case SNDRV_PCM_FORMAT_S32_LE:
+		prtd->bits_per_sample = 32;
 		break;
 	default:
 		return -EINVAL;
@@ -582,8 +617,24 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
 	int graph_id, ret;
 	bool is_push_pull;
 	struct snd_pcm_substream *substream = NULL;
+	/*
+	 * Four TDM slots feed the four AW882xx amplifiers (bottom-left,
+	 * bottom-right, top-left, top-right).  Publishing the channel map lets
+	 * PipeWire/WirePlumber present a normal quad speaker layout instead of
+	 * four anonymous AUX channels, so stereo is mixed onto all four.
+	 */
+	static const struct snd_pcm_chmap_elem q6apm_chmap_4ch[] = {
+		{ .channels = 4,
+		  .map = { SNDRV_CHMAP_FL, SNDRV_CHMAP_FR,
+			   SNDRV_CHMAP_RL, SNDRV_CHMAP_RR } },
+		{ }
+	};
 
 	graph_id = cpu_dai->driver->id;
+
+	if (pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream)
+		snd_pcm_add_chmap_ctls(pcm, SNDRV_PCM_STREAM_PLAYBACK,
+				       q6apm_chmap_4ch, 4, 0, NULL);
 
 	/* Note: DSP backend dais are uni-directional ONLY(either playback or capture) */
 	if (pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream)
@@ -603,9 +654,12 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
 		if (ret)
 			return ret;
 
-		ret = q6apm_dai_memory_map(component, substream, graph_id, is_push_pull);
-		if (ret)
-			return ret;
+		/*
+		 * The graph only exists after q6apm_graph_open(), and the graph
+		 * info comes from the topology which the ASoC core loads in the
+		 * component .probe -- i.e. after pcm_new().  Map the buffer at
+		 * open time instead (see q6apm_dai_open()).
+		 */
 	}
 
 	return 0;
