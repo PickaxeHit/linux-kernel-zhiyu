@@ -848,7 +848,7 @@ int qca_uart_setup(struct hci_dev *hdev, uint8_t baudrate,
 		case QCA_WCN7860:
 			config.type = ELF_TYPE_PATCH;
 			snprintf(config.fwname, sizeof(config.fwname),
-				 "qca/gngbtfw%02x.mbn", rom_ver);
+				 "qca/brhbtfw%02x.mbn", rom_ver);
 			break;
 		default:
 			snprintf(config.fwname, sizeof(config.fwname),
@@ -871,6 +871,12 @@ int qca_uart_setup(struct hci_dev *hdev, uint8_t baudrate,
 	} else if (err < 0 && !rampatch_name && soc_type == QCA_WCN6855) {
 		snprintf(config.fwname, sizeof(config.fwname),
 			 "qca/hpbtfw%02x.tlv", rom_ver);
+		err = qca_download_firmware(hdev, &config, soc_type, rom_ver);
+	} else if (err < 0 && soc_type == QCA_WCN7860) {
+		/* Some WCN7860 ROM revisions ship only the TLV rampatch. */
+		config.type = TLV_TYPE_PATCH;
+		snprintf(config.fwname, sizeof(config.fwname),
+			 "qca/brhbtfw%02x.tlv", rom_ver);
 		err = qca_download_firmware(hdev, &config, soc_type, rom_ver);
 	}
 
@@ -946,7 +952,7 @@ int qca_uart_setup(struct hci_dev *hdev, uint8_t baudrate,
 			break;
 		case QCA_WCN7860:
 			qca_get_nvm_name_by_board(config.fwname, sizeof(config.fwname),
-				 "gngbtnv", soc_type, ver, rom_ver, boardid);
+				 "brhbtnv", soc_type, ver, rom_ver, boardid);
 			break;
 		default:
 			snprintf(config.fwname, sizeof(config.fwname),
