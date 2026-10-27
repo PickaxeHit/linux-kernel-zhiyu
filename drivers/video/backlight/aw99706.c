@@ -338,10 +338,21 @@ static void aw99706_slave_init(struct aw99706_device *aw)
 		{ 0x0d, 0x00 }, { 0x0c, 0x48 }, { 0x06, 0xd9 }, { 0x07, 0x05 },
 		{ 0x04, 0x00 }, { 0x05, 0x00 }, { 0x08, 0x01 }, { 0x0d, 0xfe },
 	};
+	unsigned int cfg2;
 	int i;
 
 	if (!aw->slave_regmap)
 		return;
+
+	/*
+	 * CFG2 contains ILED_MAX.  The master is initialized from the DT
+	 * defaults, but the slave keeps its MTP value (0x2d, 27.5 mA) unless
+	 * it is written explicitly.  That makes one half of the panel 37.5%
+	 * brighter than the other.  Copy the master's current-limit setting
+	 * before running the rest of the slave sequence.
+	 */
+	if (!regmap_read(aw->regmap, AW99706_CFG2_REG, &cfg2))
+		regmap_write(aw->slave_regmap, AW99706_CFG2_REG, cfg2);
 
 	for (i = 0; i < ARRAY_SIZE(seq); i++)
 		regmap_write(aw->slave_regmap, seq[i][0], seq[i][1]);
