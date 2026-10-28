@@ -7,6 +7,7 @@
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
+#include <linux/regulator/consumer.h>
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
 
@@ -41,6 +42,7 @@
 struct dw9807_device {
 	struct v4l2_ctrl_handler ctrls_vcm;
 	struct v4l2_subdev sd;
+	struct regulator *vdd;
 	u16 current_val;
 };
 
@@ -75,9 +77,13 @@ static int dw9807_i2c_check(struct i2c_client *client)
 
 static int dw9807_set_dac(struct i2c_client *client, u16 data)
 {
-	const char tx_data[3] = {
-		DW9807_MSB_ADDR, ((data >> 8) & 0x03), (data & 0xff)
-	};
+	/*
+	 * This module latches the position only when the MSB register is
+	 * written in its own transfer followed by the LSB one; a single
+	 * three-byte burst is silently ignored.
+	 */
+	const char tx_msb[2] = { DW9807_MSB_ADDR, (data >> 8) & 0x03 };
+	const char tx_lsb[2] = { DW9807_LSB_ADDR, data & 0xff };
 	int val, ret;
 
 	/*
@@ -97,11 +103,17 @@ static int dw9807_set_dac(struct i2c_client *client, u16 data)
 		return ret ? -EBUSY : val;
 	}
 
-	/* Write VCM position to registers */
-	ret = i2c_master_send(client, tx_data, sizeof(tx_data));
+	/* Write VCM position: MSB first, then LSB, as separate transfers */
+	ret = i2c_master_send(client, tx_msb, sizeof(tx_msb));
 	if (ret < 0) {
-		dev_err(&client->dev,
-			"I2C write MSB fail ret=%d\n", ret);
+		dev_err(&client->dev, "I2C write MSB fail ret=%d\n", ret);
+
+		return ret;
+	}
+
+	ret = i2c_master_send(client, tx_lsb, sizeof(tx_lsb));
+	if (ret < 0) {
+		dev_err(&client->dev, "I2C write LSB fail ret=%d\n", ret);
 
 		return ret;
 	}
@@ -203,9 +215,23 @@ static int dw9807_probe(struct i2c_client *client)
 	if (rval < 0)
 		goto err_cleanup;
 
-	pm_runtime_set_active(&client->dev);
+	dw9807_dev->vdd = devm_regulator_get_optional(&client->dev, "vdd");
+	if (IS_ERR(dw9807_dev->vdd)) {
+		int err = PTR_ERR(dw9807_dev->vdd);
+
+		dw9807_dev->vdd = NULL;
+		if (err != -ENODEV)
+			return err;
+	}
+
+	/*
+	 * The actuator is powered by the camera rail, which may be off at
+	 * probe time.  Mark the device suspended without running the PM
+	 * callbacks so the first open() resumes it (and powers the rail)
+	 * instead of leaving runtime PM stuck in the error state.
+	 */
+	pm_runtime_set_suspended(&client->dev);
 	pm_runtime_enable(&client->dev);
-	pm_runtime_idle(&client->dev);
 
 	return 0;
 
@@ -237,22 +263,22 @@ static int __maybe_unused dw9807_vcm_suspend(struct device *dev)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct dw9807_device *dw9807_dev = sd_to_dw9807_vcm(sd);
 	const char tx_data[2] = { DW9807_CTL_ADDR, 0x01 };
-	int ret, val;
+	int ret;
 
-	for (val = dw9807_dev->current_val & ~(DW9807_CTRL_STEPS - 1);
-	     val >= 0; val -= DW9807_CTRL_STEPS) {
-		ret = dw9807_set_dac(client, val);
-		if (ret)
-			dev_err_once(dev, "%s I2C failure: %d", __func__, ret);
-		usleep_range(DW9807_CTRL_DELAY_US, DW9807_CTRL_DELAY_US + 10);
-	}
+	if (dw9807_dev->vdd)
+		regulator_disable(dw9807_dev->vdd);
 
-	/* Power down */
-	ret = i2c_master_send(client, tx_data, sizeof(tx_data));
-	if (ret < 0) {
-		dev_err(&client->dev, "I2C write CTL fail ret = %d\n", ret);
-		return ret;
-	}
+	/*
+	 * Park the lens where it is: ramping down to 0 drives this actuator
+	 * past its near limit, and it also loses the position between the
+	 * short open/set/close cycles used by v4l2-ctl.
+	 */
+	/*
+	 * Do not power the driver down here: the coil would release and the
+	 * lens would spring back between the short open/set/close cycles.
+	 * The rail is dropped at the end of the session instead.
+	 */
+	(void)tx_data;
 
 	return 0;
 }
@@ -269,26 +295,28 @@ static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct dw9807_device *dw9807_dev = sd_to_dw9807_vcm(sd);
 	const char tx_data[2] = { DW9807_CTL_ADDR, 0x00 };
-	int ret, val;
+	int ret;
+
+	/* The actuator shares the camera's 2.8V rail; bring it up first. */
+	if (dw9807_dev->vdd) {
+		ret = regulator_enable(dw9807_dev->vdd);
+		if (ret)
+			return ret;
+		usleep_range(1000, 2000);
+	}
 
 	/* Power on */
 	ret = i2c_master_send(client, tx_data, sizeof(tx_data));
 	if (ret < 0) {
 		dev_err(&client->dev, "I2C write CTL fail ret = %d\n", ret);
+		if (dw9807_dev->vdd)
+			regulator_disable(dw9807_dev->vdd);
 		return ret;
 	}
 
-	for (val = dw9807_dev->current_val % DW9807_CTRL_STEPS;
-	     val < dw9807_dev->current_val + DW9807_CTRL_STEPS - 1;
-	     val += DW9807_CTRL_STEPS) {
-		ret = dw9807_set_dac(client, val);
-		if (ret)
-			dev_err_ratelimited(dev, "%s I2C failure: %d",
-						__func__, ret);
-		usleep_range(DW9807_CTRL_DELAY_US, DW9807_CTRL_DELAY_US + 10);
-	}
+	usleep_range(1000, 2000);
+	return dw9807_set_dac(client, dw9807_dev->current_val);
 
-	return 0;
 }
 
 static const struct of_device_id dw9807_of_table[] = {
