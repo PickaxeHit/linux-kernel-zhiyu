@@ -461,6 +461,7 @@ int msm_tpg_register_entity(struct tpg_device *tpg,
 	snprintf(sd->name, ARRAY_SIZE(sd->name), "%s%d",
 		 "msm_tpg", tpg->id);
 	sd->grp_id = TPG_GRP_ID;
+	sd->entity.function = MEDIA_ENT_F_PROC_VIDEO_PIXEL_FORMATTER;
 	v4l2_set_subdevdata(sd, tpg);
 
 	ret = v4l2_ctrl_handler_init(&tpg->ctrls, 1);
