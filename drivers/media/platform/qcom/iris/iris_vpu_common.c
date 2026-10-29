@@ -471,6 +471,16 @@ u64 iris_vpu3x_vpu4x_calculate_frequency(struct iris_inst *inst, size_t data_siz
 	if (inst->codec == V4L2_PIX_FMT_AV1)
 		freq *= 3;
 
+	/*
+	 * 10-bit pictures are twice the size of 8-bit ones and the firmware
+	 * runs an extra pass over the low bits, which the estimate does not
+	 * account for.  Measured on VPU 3.5 with a 4K60 HEVC Main10 stream:
+	 * on the point an equivalent 8-bit stream gets, playback drops ~1.5
+	 * frames per second; one point higher and it drops ~0.1.
+	 */
+	if (inst->fw_caps[BIT_DEPTH].value == BIT_DEPTH_10)
+		freq *= 2;
+
 	return freq;
 }
 
