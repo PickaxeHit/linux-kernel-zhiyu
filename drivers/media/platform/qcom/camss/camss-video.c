@@ -234,11 +234,27 @@ static int video_check_format(struct camss_video *video)
 	return 0;
 }
 
+static int video_check_pipeline_format(struct camss_video *video);
+
 static int video_prepare_streaming(struct vb2_queue *q)
 {
 	struct camss_video *video = vb2_get_drv_priv(q);
 	struct video_device *vdev = &video->vdev;
 	int ret;
+
+	/*
+	 * Refuse to power up a pipeline that cannot produce what the video
+	 * node was asked for; powering up a video front end with a geometry
+	 * that does not match the sensor is what makes it write past the end
+	 * of its buffers.
+	 */
+	ret = video_check_format(video);
+	if (ret < 0)
+		return ret;
+
+	ret = video_check_pipeline_format(video);
+	if (ret < 0)
+		return ret;
 
 	ret = v4l2_pipeline_pm_get(&vdev->entity);
 	if (ret < 0) {
@@ -249,13 +265,102 @@ static int video_prepare_streaming(struct vb2_queue *q)
 	return ret;
 }
 
+/*
+ * The subdevices streaming into a video node, ordered from the video node
+ * upwards: VFE first, then CSID, CSIPHY and finally the sensor.
+ */
+#define CAMSS_VIDEO_MAX_ENTITIES 8
+
+static int video_pipeline_entities(struct camss_video *video,
+				   struct v4l2_subdev *subdevs[],
+				   unsigned int max)
+{
+	struct video_device *vdev = &video->vdev;
+	struct media_entity *entity = &vdev->entity;
+	unsigned int n = 0;
+
+	while (n < max) {
+		struct media_pad *pad = &entity->pads[0];
+
+		if (!(pad->flags & MEDIA_PAD_FL_SINK))
+			break;
+
+		pad = media_pad_remote_pad_first(pad);
+		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
+			break;
+
+		entity = pad->entity;
+		subdevs[n++] = media_entity_to_v4l2_subdev(entity);
+	}
+
+	return n;
+}
+
+/*
+ * The write master of the video front end translates the stream it receives
+ * into writes at stride * line intervals, without any bounds check and
+ * without an IOMMU in between: if the geometry it is programmed with differs
+ * from what the sensor and the CSI receiver actually deliver, the video
+ * front end writes past the end of the buffer into whatever physical memory
+ * happens to follow it.  Nothing in the V4L2 API prevents an application from
+ * setting a format on the video node alone, so check the whole chain - sensor
+ * included - before letting a stream start.
+ */
+static int video_check_pipeline_format(struct camss_video *video)
+{
+	struct v4l2_pix_format_mplane *pix = &video->active_fmt.fmt.pix_mp;
+	struct v4l2_subdev *subdevs[CAMSS_VIDEO_MAX_ENTITIES];
+	unsigned int nsubdevs, i;
+	int ret;
+
+	nsubdevs = video_pipeline_entities(video, subdevs, ARRAY_SIZE(subdevs));
+
+	/*
+	 * Starting the front end without a sensor at the other end of the
+	 * pipeline powers up a video front end nobody feeds; refuse instead.
+	 */
+	if (nsubdevs == 0 ||
+	    subdevs[nsubdevs - 1]->entity.function != MEDIA_ENT_F_CAM_SENSOR) {
+		dev_err(video->camss->dev,
+			"%s: pipeline does not lead to a camera sensor\n",
+			video->vdev.name);
+		return -EPIPE;
+	}
+
+	for (i = 0; i < nsubdevs; i++) {
+		struct v4l2_subdev_format fmt = {
+			.which = V4L2_SUBDEV_FORMAT_ACTIVE,
+			.pad = 0,
+		};
+
+		ret = v4l2_subdev_call(subdevs[i], pad, get_fmt, NULL, &fmt);
+		if (ret)
+			return ret;
+
+		/* The video node format must be representable as this mbus code. */
+		ret = camss_format_find_format(fmt.format.code, pix->pixelformat,
+					       video->formats, video->nformats);
+		if (ret < 0 || fmt.format.width != pix->width ||
+		    fmt.format.height != pix->height) {
+			dev_err(video->camss->dev,
+				"%s: %s runs %ux%u code %#x, video node %ux%u %p4cc\n",
+				video->vdev.name, subdevs[i]->name,
+				fmt.format.width, fmt.format.height,
+				fmt.format.code, pix->width, pix->height,
+				&pix->pixelformat);
+			return -EPIPE;
+		}
+	}
+
+	return 0;
+}
+
 static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct camss_video *video = vb2_get_drv_priv(q);
 	struct video_device *vdev = &video->vdev;
-	struct media_entity *entity;
-	struct media_pad *pad;
-	struct v4l2_subdev *subdev;
+	struct v4l2_subdev *subdevs[CAMSS_VIDEO_MAX_ENTITIES];
+	unsigned int nsubdevs, i;
 	int ret;
 
 	ret = video_device_pipeline_alloc_start(vdev);
@@ -268,25 +373,33 @@ static int video_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret < 0)
 		goto error;
 
-	entity = &vdev->entity;
-	while (1) {
-		pad = &entity->pads[0];
-		if (!(pad->flags & MEDIA_PAD_FL_SINK))
-			break;
+	ret = video_check_pipeline_format(video);
+	if (ret < 0)
+		goto error;
 
-		pad = media_pad_remote_pad_first(pad);
-		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
-			break;
+	/*
+	 * Bring the pipeline up one entity at a time.  If one of them fails,
+	 * the ones already streaming have to be stopped again: a video front
+	 * end left with its write master enabled while the pipeline is powered
+	 * down faults the interconnect, and the resulting SError takes the
+	 * whole system down.
+	 */
+	nsubdevs = video_pipeline_entities(video, subdevs,
+					   ARRAY_SIZE(subdevs));
 
-		entity = pad->entity;
-		subdev = media_entity_to_v4l2_subdev(entity);
-
-		ret = v4l2_subdev_call(subdev, video, s_stream, 1);
+	for (i = 0; i < nsubdevs; i++) {
+		ret = v4l2_subdev_call(subdevs[i], video, s_stream, 1);
 		if (ret < 0 && ret != -ENOIOCTLCMD)
-			goto error;
+			goto error_streaming;
 	}
 
 	return 0;
+
+error_streaming:
+	dev_err(video->camss->dev, "Failed to start %s: %d\n",
+		subdevs[i]->name, ret);
+	while (i--)
+		v4l2_subdev_call(subdevs[i], video, s_stream, 0);
 
 error:
 	video_device_pipeline_stop(vdev);
@@ -301,30 +414,22 @@ static void video_stop_streaming(struct vb2_queue *q)
 {
 	struct camss_video *video = vb2_get_drv_priv(q);
 	struct video_device *vdev = &video->vdev;
-	struct media_entity *entity;
-	struct media_pad *pad;
-	struct v4l2_subdev *subdev;
+	struct v4l2_subdev *subdevs[CAMSS_VIDEO_MAX_ENTITIES];
+	unsigned int nsubdevs, i;
 	int ret;
 
-	entity = &vdev->entity;
-	while (1) {
-		pad = &entity->pads[0];
-		if (!(pad->flags & MEDIA_PAD_FL_SINK))
-			break;
+	nsubdevs = video_pipeline_entities(video, subdevs, ARRAY_SIZE(subdevs));
 
-		pad = media_pad_remote_pad_first(pad);
-		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
-			break;
-
-		entity = pad->entity;
-		subdev = media_entity_to_v4l2_subdev(entity);
-
-		ret = v4l2_subdev_call(subdev, video, s_stream, 0);
-
-		if (ret) {
-			dev_err(video->camss->dev, "Video pipeline stop failed: %d\n", ret);
-			return;
-		}
+	/*
+	 * Stop from the video node upwards, so that the write master is idle
+	 * before the entities feeding it are stopped.  A failure to stop one
+	 * entity is not a reason to leave the rest running.
+	 */
+	for (i = 0; i < nsubdevs; i++) {
+		ret = v4l2_subdev_call(subdevs[i], video, s_stream, 0);
+		if (ret)
+			dev_err(video->camss->dev,
+				"Failed to stop %s: %d\n", subdevs[i]->name, ret);
 	}
 
 	video_device_pipeline_stop(vdev);
