@@ -426,7 +426,7 @@ u64 iris_vpu3x_vpu4x_calculate_frequency(struct iris_inst *inst, size_t data_siz
 	struct v4l2_format *inp_f = inst->fmt_src;
 	u32 height, width, mbs_per_second, mbpf;
 	u64 fw_cycles, fw_vpp_cycles;
-	u64 vsp_cycles, vpp_cycles;
+	u64 vsp_cycles, vpp_cycles, freq;
 	u32 fps = inst->frame_rate;
 
 	width = max(inp_f->fmt.pix_mp.width, inst->crop.width);
@@ -458,7 +458,20 @@ u64 iris_vpu3x_vpu4x_calculate_frequency(struct iris_inst *inst, size_t data_siz
 	if (inst->fw_caps[STAGE].value == STAGE_1)
 		vsp_cycles = vsp_cycles * 3;
 
-	return max3(vpp_cycles, vsp_cycles, fw_cycles);
+	freq = max3(vpp_cycles, vsp_cycles, fw_cycles);
+
+	/*
+	 * AV1 needs about three times the cycles per macroblock of H.264 or
+	 * HEVC, which the estimate above does not know about.  Measured on
+	 * VPU 3.5: a 4K60 HEVC stream decodes at ~340 fps on the lowest
+	 * operating point while a 4K60 AV1 stream reaches only ~104 fps there
+	 * and drops frames, and raising the operating point makes it keep up.
+	 * Without this a 4K60 AV1 stream stays on that lowest point.
+	 */
+	if (inst->codec == V4L2_PIX_FMT_AV1)
+		freq *= 3;
+
+	return freq;
 }
 
 int iris_vpu_power_on(struct iris_core *core)
