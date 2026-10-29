@@ -4,6 +4,7 @@
 #define __QCOM_Q6V5_H__
 
 #include <linux/kernel.h>
+#include <linux/spinlock.h>
 #include <linux/completion.h>
 #include <linux/soc/qcom/qcom_aoss.h>
 
@@ -30,6 +31,11 @@ struct qcom_q6v5 {
 	int stop_irq;
 
 	bool handover_issued;
+
+	/* The handover interrupt is a one-shot signal, enabled on start and
+	 * disabled again as soon as the remote processor has signalled it. */
+	bool handover_irq_enabled;
+	spinlock_t handover_lock;
 
 	struct completion start_done;
 	struct completion stop_done;
