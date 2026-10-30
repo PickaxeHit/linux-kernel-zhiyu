@@ -227,17 +227,28 @@ static int sm8750_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	return 0;
 }
 
-#define SM8750_MAX_LINKS 8
+/*
+ * Indexed by the CPU DAI id of the backend, which is a port number (for
+ * example TX_CODEC_DMA_TX_3 is 120), so the table has to cover the whole
+ * id space rather than the number of links.
+ */
+#define SM8750_MAX_DAI_ID 256
 
-static bool sm8750_stream_prepared[SM8750_MAX_LINKS];
+static bool sm8750_stream_prepared[SM8750_MAX_DAI_ID];
 
 static int sm8750_snd_prepare(struct snd_pcm_substream *substream)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	int ret;
 
-	return qcom_snd_sdw_prepare(substream,
-				    &sm8750_stream_prepared[cpu_dai->id]);
+	dev_dbg(rtd->dev, "capture prepare cpu dai %s id %d\n",
+		cpu_dai->name, cpu_dai->id);
+	ret = qcom_snd_sdw_prepare(substream,
+				   &sm8750_stream_prepared[cpu_dai->id]);
+	dev_dbg(rtd->dev, "capture prepare -> %d (prepared %d)\n", ret,
+		sm8750_stream_prepared[cpu_dai->id]);
+	return ret;
 }
 
 static int sm8750_snd_hw_free(struct snd_pcm_substream *substream)
