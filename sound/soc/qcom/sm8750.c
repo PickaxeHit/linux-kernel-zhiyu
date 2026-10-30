@@ -266,9 +266,43 @@ static int sm8750_snd_hw_free(struct snd_pcm_substream *substream)
  * handed to every codec DAI - without it the codec has no stream runtime when
  * hw_params runs.
  */
+/*
+ * The codec-DMA (LPAIF RXTX) interface, like the TDM ones, is only clocked
+ * once the application processor votes for the interface clock through PRM.
+ * Without it the DSP starts the graphs but the codec-DMA backend never fills
+ * a period, so every capture read comes back with zero bytes.
+ */
+static uint codec_dma_clk_hz;
+module_param(codec_dma_clk_hz, uint, 0644);
+MODULE_PARM_DESC(codec_dma_clk_hz,
+		 "codec-DMA interface clock in Hz (0 = rate * channels * 16)");
+
+static int sm8750_capture_hw_params(struct snd_pcm_substream *substream,
+				    struct snd_pcm_hw_params *params)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+	unsigned int clk;
+	int ret;
+
+	clk = codec_dma_clk_hz;
+	if (!clk)
+		clk = params_rate(params) * params_channels(params) * 16;
+
+	ret = snd_soc_dai_set_sysclk(cpu_dai, LPAIF_MI2S_BCLK, clk,
+				     SND_SOC_CLOCK_IN);
+	if (ret && ret != -ENOTSUPP)
+		dev_err(cpu_dai->dev, "codec-DMA set_sysclk(%u): %d\n", clk, ret);
+	else
+		dev_info(cpu_dai->dev, "codec-DMA interface clock %u Hz\n", clk);
+
+	return 0;
+}
+
 static const struct snd_soc_ops sm8750_capture_ops = {
 	.startup = qcom_snd_sdw_startup,
 	.shutdown = qcom_snd_sdw_shutdown,
+	.hw_params = sm8750_capture_hw_params,
 	.prepare = sm8750_snd_prepare,
 	.hw_free = sm8750_snd_hw_free,
 };

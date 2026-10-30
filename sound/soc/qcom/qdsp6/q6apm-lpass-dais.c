@@ -662,6 +662,7 @@ static const struct snd_soc_dai_ops q6dma_ops = {
 	.shutdown	= q6apm_lpass_dai_shutdown,
 	.set_channel_map  = q6dma_set_channel_map,
 	.hw_params        = q6dma_hw_params,
+	.set_sysclk	= q6i2s_set_sysclk,
 	.trigger	= q6apm_lpass_dai_trigger,
 };
 
@@ -709,11 +710,14 @@ static int of_q6apm_parse_dai_data(struct device *dev,
 		}
 
 		switch (id) {
-		/* MI2S/TDM specific properties */
+		/* MI2S/TDM/codec-DMA: the interface clock comes from PRM */
 		case PRIMARY_MI2S_RX ... QUATERNARY_MI2S_TX:
 		case QUINARY_MI2S_RX ... QUINARY_MI2S_TX:
 		case SENARY_MI2S_RX ... SENARY_MI2S_TX:
 		case PRIMARY_TDM_RX_0 ... QUINARY_TDM_TX_7:
+		case WSA_CODEC_DMA_RX_0 ... WSA_CODEC_DMA_TX_1:
+		case VA_CODEC_DMA_TX_0:
+		case RX_CODEC_DMA_RX_0 ... TX_CODEC_DMA_TX_5:
 			priv = &data->priv[id];
 			priv->mclk = of_clk_get_by_name(node, "mclk");
 			if (IS_ERR(priv->mclk)) {
