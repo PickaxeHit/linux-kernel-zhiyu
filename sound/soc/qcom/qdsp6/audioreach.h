@@ -1098,6 +1098,9 @@ int audioreach_set_media_format(struct q6apm_graph *graph,
 int audioreach_shared_memory_send_eos(struct q6apm_graph *graph);
 int audioreach_gain_set_vol_ctrl(struct q6apm *apm,
 				 const struct audioreach_module *module, int vol);
+int audioreach_send_raw_param(struct q6apm_graph *graph,
+			      const struct audioreach_module *module,
+			      uint32_t param_id, const void *data, size_t len);
 int audioreach_send_u32_param(struct q6apm_graph *graph,
 			      const struct audioreach_module *module,
 			      uint32_t param_id, uint32_t param_val);

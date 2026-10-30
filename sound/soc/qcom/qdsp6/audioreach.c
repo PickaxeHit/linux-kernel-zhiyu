@@ -913,6 +913,38 @@ static int audioreach_codec_dma_set_media_format(struct q6apm_graph *graph,
 	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
 }
 
+/*
+ * Send a module parameter whose payload is a raw byte blob.  The vendor's
+ * ACDB carries such a parameter for the codec-DMA source module
+ * (PARAM_ID 0x08001063, payload {1, 4, channel-mask}), so the adapter needs
+ * a way to hand byte payloads to a module, not just single u32 values.
+ */
+int audioreach_send_raw_param(struct q6apm_graph *graph,
+			      const struct audioreach_module *module,
+			      uint32_t param_id, const void *data, size_t len)
+{
+	struct apm_module_param_data *param_data;
+	size_t payload_size = ALIGN(len, 4) + APM_MODULE_PARAM_DATA_SIZE;
+	void *param;
+	struct gpr_pkt *pkt __free(kfree) =
+		audioreach_alloc_apm_cmd_pkt(payload_size, APM_CMD_SET_CFG, 0);
+	if (IS_ERR(pkt))
+		return -ENOMEM;
+
+	param = (void *)pkt + GPR_HDR_SIZE + APM_CMD_HDR_SIZE;
+
+	param_data = param;
+	param_data->module_instance_id = module->instance_id;
+	param_data->error_code = 0;
+	param_data->param_id = param_id;
+	param_data->param_size = len;
+
+	memcpy(param + APM_MODULE_PARAM_DATA_SIZE, data, len);
+
+	return q6apm_send_cmd_sync(graph->apm, pkt, 0);
+}
+EXPORT_SYMBOL_GPL(audioreach_send_raw_param);
+
 int audioreach_send_u32_param(struct q6apm_graph *graph,
 			      const struct audioreach_module *module,
 			      uint32_t param_id, uint32_t param_val)
