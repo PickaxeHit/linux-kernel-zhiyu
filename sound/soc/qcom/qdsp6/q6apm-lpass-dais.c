@@ -281,6 +281,30 @@ static int q6apm_lpass_dai_graph_id(struct snd_soc_dai *dai)
 	return be_graph_id >= 0 ? be_graph_id : dai->id;
 }
 
+/*
+ * Graph-info id used for the capture backends.  -1 keeps the old behaviour
+ * (the DAI index, i.e. the codec-DMA device sub-graph has a graph of its own);
+ * the frontend graph id means the topology put the device sub-graph into the
+ * frontend graph, so - exactly like the TDM playback backends above - the
+ * backend only pushes its module configuration through the shared graph and
+ * leaves GRAPH_PREPARE/GRAPH_START to the frontend.
+ *
+ * The capture frontend is MultiMedia3, whose q6apm-dai graph id is its DAI
+ * index (2), so this cannot share be_graph_id with playback (MultiMedia1 = 0).
+ */
+static int capture_be_graph_id = -1;
+module_param(capture_be_graph_id, int, 0644);
+MODULE_PARM_DESC(capture_be_graph_id,
+		 "graph-info id for capture backends (-1 = DAI index)");
+
+static int q6apm_lpass_dai_graph_id_stream(struct snd_soc_dai *dai, int stream)
+{
+	if (stream == SNDRV_PCM_STREAM_CAPTURE && capture_be_graph_id >= 0)
+		return capture_be_graph_id;
+
+	return q6apm_lpass_dai_graph_id(dai);
+}
+
 struct deferred_be_item {
 	struct snd_soc_dai *dai;
 	int stream;
@@ -441,6 +465,44 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 	}
 
 	/*
+	 * Single-graph capture: the codec-DMA device sub-graph is part of the
+	 * frontend graph, so push its module configuration through that graph
+	 * here (hw_params has already filled in the wire format, which is what
+	 * becomes PARAM_ID_CODEC_DMA_INTF_CFG) and leave GRAPH_PREPARE and
+	 * GRAPH_START to the frontend, which starts both sub-graphs at once.
+	 *
+	 * Opening the graph now is what sends GRAPH_OPEN: the frontend finds the
+	 * same handle later through the graph idr, so this is also where the
+	 * cross-sub-graph connection is handed to the DSP - with both sub-graphs
+	 * present in the payload, which is what the device sub-graph needs.
+	 */
+	if (capture_be_graph_id >= 0 &&
+	    substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
+		if (!dai_data->graph[dai->id]) {
+			graph = q6apm_graph_open(dai->dev, NULL, dai->dev,
+						 capture_be_graph_id,
+						 substream->stream);
+			if (IS_ERR(graph)) {
+				dev_err(dai->dev, "Failed to open graph (%d)\n",
+					capture_be_graph_id);
+				return PTR_ERR(graph);
+			}
+			dai_data->graph[dai->id] = graph;
+		}
+		cfg->direction = substream->stream;
+		rc = q6apm_graph_media_format_device(dai_data->graph[dai->id], cfg);
+		if (rc) {
+			dev_err(dai->dev, "Failed to set media format %d\n", rc);
+			q6apm_graph_close(dai_data->graph[dai->id]);
+			dai_data->graph[dai->id] = NULL;
+			return rc;
+		}
+		dev_dbg(dai->dev, "port %d: single-graph capture via graph %d\n",
+			dai->id, capture_be_graph_id);
+		return 0;
+	}
+
+	/*
 	 * Single-graph mode (be_start_mode 3): the device sub-graph lives in the
 	 * frontend graph, which the frontend opens and prepares.  Only push the
 	 * TDM media format here - and do it now, so the interface is configured
@@ -559,7 +621,7 @@ static int q6apm_lpass_dai_startup(struct snd_pcm_substream *substream, struct s
 {
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
 	struct q6apm_graph *graph;
-	int graph_id = dai->id;
+	int graph_id = q6apm_lpass_dai_graph_id_stream(dai, substream->stream);
 
 	dev_dbg(dai->dev, "port %d: startup stream %d\n", dai->id, substream->stream);
 
@@ -569,7 +631,7 @@ static int q6apm_lpass_dai_startup(struct snd_pcm_substream *substream, struct s
 			dev_err(dai->dev, "Failed to open graph (%d)\n", graph_id);
 			return PTR_ERR(graph);
 		}
-		dai_data->graph[graph_id] = graph;
+		dai_data->graph[dai->id] = graph;
 	}
 
 	return 0;
