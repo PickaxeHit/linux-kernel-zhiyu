@@ -794,6 +794,45 @@ static int audioreach_graph_media_format(struct q6apm_graph *graph,
 	return 0;
 }
 
+/*
+ * The vendor sends the codec-DMA source module one parameter (0x08001063,
+ * payload {1, 4, channel-mask}) describing which channels of the LPAIF
+ * interface the interface carries; the ACDB holds one variant per channel
+ * count (mask 0x4 for one channel, 0x6 for two, 0xe for three, 0x1e for four).
+ * Without it the codec-DMA backend produces no frames.
+ */
+int q6apm_codec_dma_set_channel_mask(struct q6apm_graph *graph, unsigned int channels)
+{
+	struct audioreach_graph_info *info = graph->info;
+	struct audioreach_sub_graph *sgs;
+	struct audioreach_container *container;
+	struct audioreach_module *module;
+	u32 param[3];
+
+	if (!channels || channels > 4)
+		return -EINVAL;
+
+	param[0] = 1;
+	param[1] = 4;
+	param[2] = ((1U << channels) - 1) << 1;
+
+	list_for_each_entry(sgs, &info->sg_list, node) {
+		list_for_each_entry(container, &sgs->container_list, node) {
+			list_for_each_entry(module, &container->modules_list, node) {
+				if (module->module_id != MODULE_ID_CODEC_DMA_SOURCE)
+					continue;
+
+				return audioreach_send_raw_param(graph, module,
+								 0x08001063, param,
+								 sizeof(param));
+			}
+		}
+	}
+
+	return -ENODEV;
+}
+EXPORT_SYMBOL_GPL(q6apm_codec_dma_set_channel_mask);
+
 int q6apm_graph_media_format_pcm(struct q6apm_graph *graph, struct audioreach_module_config *cfg)
 {
 	return audioreach_graph_media_format(graph, cfg, 0);

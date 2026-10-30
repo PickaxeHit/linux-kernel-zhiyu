@@ -518,6 +518,34 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 		dev_err(dai->dev, "Failed to prepare Graph %d\n", rc);
 		goto err;
 	}
+
+	/*
+	 * Capture runs the device (source) sub-graph, so it has to be started
+	 * before the stream (sink) graph: DPCM prepares backends before it
+	 * starts the frontend, which is exactly the order the DSP wants here.
+	 * Playback keeps starting the device graph from the trigger.
+	 */
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+	    !dai_data->is_port_started[dai->id]) {
+		/*
+		 * Tell the codec-DMA source module which channels of the LPAIF
+		 * interface this stream carries.  The vendor's ACDB stores this
+		 * as parameter 0x08001063 ({1, 4, mask}) with one variant per
+		 * channel count; without it the backend never fills a period.
+		 */
+		rc = q6apm_codec_dma_set_channel_mask(dai_data->graph[dai->id],
+						      cfg->num_channels ?: 2);
+		if (rc)
+			dev_warn(dai->dev, "port %d: codec-DMA channel mask failed %d\n",
+				 dai->id, rc);
+
+		rc = q6apm_graph_start(dai_data->graph[dai->id]);
+		if (rc) {
+			dev_err(dai->dev, "Failed to start APM port %d\n", dai->id);
+			goto err;
+		}
+		dai_data->is_port_started[dai->id] = true;
+	}
 	return 0;
 err:
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
