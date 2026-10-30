@@ -276,8 +276,6 @@ static int be_graph_id = 0;
 module_param(be_graph_id, int, 0644);
 MODULE_PARM_DESC(be_graph_id, "graph-info id for backend DAIs (-1 = DAI index)");
 
-MODULE_PARM_DESC(be_graph_id, "graph-info id for backend DAIs (-1 = DAI index)");
-
 static int q6apm_lpass_dai_graph_id(struct snd_soc_dai *dai)
 {
 	return be_graph_id >= 0 ? be_graph_id : dai->id;
@@ -389,6 +387,8 @@ static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
 	int ret = 0;
 
+	dev_dbg(dai->dev, "port %d: trigger %d stream %d\n", dai->id, cmd, substream->stream);
+
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
@@ -430,6 +430,9 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 	struct q6apm_graph *graph;
 	int gid = q6apm_lpass_dai_graph_id(dai);
 	int rc;
+
+	dev_dbg(dai->dev, "port %d: prepare stream %d graph %p\n", dai->id,
+		substream->stream, dai_data->graph[dai->id]);
 
 	if (dai_data->is_port_started[dai->id]) {
 		q6apm_graph_stop(dai_data->graph[dai->id]);
@@ -529,6 +532,8 @@ static int q6apm_lpass_dai_startup(struct snd_pcm_substream *substream, struct s
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
 	struct q6apm_graph *graph;
 	int graph_id = dai->id;
+
+	dev_dbg(dai->dev, "port %d: startup stream %d\n", dai->id, substream->stream);
 
 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
 		graph = q6apm_graph_open(dai->dev, NULL, dai->dev, graph_id, substream->stream);
