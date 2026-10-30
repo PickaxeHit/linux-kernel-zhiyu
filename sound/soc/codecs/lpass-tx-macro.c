@@ -285,6 +285,7 @@ struct tx_macro {
 	int dec_mode[NUM_DECIMATORS];
 	struct lpass_macro *pds;
 	bool bcs_clk_en;
+	u32 dmic_clk_sel;
 };
 #define to_tx_macro(_hw) container_of(_hw, struct tx_macro, hw)
 
@@ -842,10 +843,21 @@ static int tx_macro_put_dec_enum(struct snd_kcontrol *kcontrol,
 	}
 
 	if (val != 0) {
-		if (widget->shift) /* MSM DMIC */
+		if (widget->shift) { /* MSM DMIC */
+			unsigned int dmic = val - 1;
+			u16 clk_reg = CDC_TX_TOP_CSR_SWR_DMICn_CTL(dmic / 2);
+
 			snd_soc_component_write_field(component, mic_sel_reg,
 						      CDC_TXn_ADC_DMIC_SEL_MASK, 1);
-		else if (tx->data->ver <= LPASS_VER_9_0_0)
+			/*
+			 * The DMIC clock has to be set up here: the DEC/DMIC
+			 * split means nothing else programs these registers,
+			 * and an unclocked DMIC is simply silent.
+			 */
+			snd_soc_component_update_bits(component, clk_reg,
+						      CDC_TX_SWR_DMIC_CLK_SEL_MASK,
+						      tx->dmic_clk_sel << 1);
+		} else if (tx->data->ver <= LPASS_VER_9_0_0)
 			tx_macro_update_smic_sel_v9(component, widget, tx,
 						    mic_sel_reg, val);
 		else
@@ -2308,6 +2320,8 @@ static int tx_macro_probe(struct platform_device *pdev)
 	dev_set_drvdata(dev, tx);
 
 	tx->dev = dev;
+	of_property_read_u32(dev->of_node, "qcom,tx-dmic-clk-div-factor",
+			     &tx->dmic_clk_sel);
 
 	/* Set active_decimator default value */
 	tx->active_decimator[TX_MACRO_AIF1_CAP] = -1;
