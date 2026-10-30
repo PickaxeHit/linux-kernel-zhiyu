@@ -257,7 +257,32 @@ static struct snd_soc_aux_dev sm8750_aux_devs[] = {
  * has been registered with the card, which happens after late_probe(), so poll
  * for it from a delayed work instead of racing the card registration.
  */
-#define SM8750_TDM_MIXER_CONTROL "SECONDARY_TDM_RX_0 Audio Mixer MultiMedia1"
+static const char * const sm8750_mixer_controls[] = {
+	/* stream sub-graph -> speaker TDM device sub-graph */
+	"SECONDARY_TDM_RX_0 Audio Mixer MultiMedia1",
+	/* stream sub-graph -> DMIC capture device sub-graph */
+	"MultiMedia3 Mixer VA_CODEC_DMA_TX_0",
+};
+
+/*
+ * VA macro capture path.  On the vendor stack these are userspace (UCM) mixer
+ * controls; here the machine driver owns them so the microphones work without
+ * a UCM profile.  The values are the stock "va-mic-dmic" path: DEC0 and DEC1
+ * feed the VA AIF1 mixer and their DMIC muxes select DMIC2/DMIC3, the two data
+ * lines this board routes (LPI gpio8/gpio9).
+ */
+static const char * const sm8750_capture_mixer_controls[] = {
+	"VA_AIF1_CAP Mixer DEC0",
+	"VA_AIF1_CAP Mixer DEC1",
+};
+
+static const struct {
+	const char *name;
+	const char *item;
+} sm8750_capture_mux_controls[] = {
+	{ "VA DMIC MUX0", "DMIC2" },
+	{ "VA DMIC MUX1", "DMIC3" },
+};
 #define SM8750_TDM_MIXER_TRIES 25
 #define SM8750_TDM_MIXER_INTERVAL_MS 200
 
@@ -267,37 +292,98 @@ static int sm8750_mixer_tries;
 static void sm8750_mixer_work(struct work_struct *work);
 static DECLARE_DELAYED_WORK(sm8750_mixer_work_struct, sm8750_mixer_work);
 
-static void sm8750_mixer_work(struct work_struct *work)
+static void sm8750_ctl_set_bool(struct snd_soc_card *card, const char *name)
 {
 	struct snd_ctl_elem_value uctl = { 0 };
-	struct snd_kcontrol *kctl;
-	struct snd_soc_card *card = sm8750_card_ptr;
-	int i;
+	struct snd_kcontrol *kctl = snd_soc_card_get_kcontrol(card, name);
+	int c;
 
-	if (!card)
+	if (!kctl)
 		return;
 
-	kctl = snd_soc_card_get_kcontrol(card, SM8750_TDM_MIXER_CONTROL);
-	if (!kctl) {
-		if (++sm8750_mixer_tries < SM8750_TDM_MIXER_TRIES) {
-			schedule_delayed_work(&sm8750_mixer_work_struct,
-					      msecs_to_jiffies(SM8750_TDM_MIXER_INTERVAL_MS));
+	uctl.id = kctl->id;
+	for (c = 0; c < 2; c++)
+		uctl.value.integer.value[c] = 1;
+
+	if (kctl->put(kctl, &uctl) < 0)
+		dev_err(card->dev, "failed to enable %s\n", name);
+	else
+		dev_dbg(card->dev, "enabled %s\n", name);
+}
+
+/* Select an enumerated mixer by item name; the item order is driver-defined. */
+static void sm8750_ctl_set_enum(struct snd_soc_card *card, const char *name,
+				const char *item)
+{
+	struct snd_ctl_elem_value uctl = { 0 };
+	struct snd_ctl_elem_info info = { 0 };
+	struct snd_kcontrol *kctl = snd_soc_card_get_kcontrol(card, name);
+	int i;
+
+	if (!kctl)
+		return;
+
+	info.id = kctl->id;
+	if (kctl->info(kctl, &info) < 0)
+		return;
+	if (info.type != SNDRV_CTL_ELEM_TYPE_ENUMERATED) {
+		dev_err(card->dev, "%s is not an enumerated control\n", name);
+		return;
+	}
+
+	for (i = 0; i < info.value.enumerated.items; i++) {
+		info.value.enumerated.item = i;
+		if (kctl->info(kctl, &info) < 0)
 			return;
-		}
-		dev_warn(card->dev, "%s: control not found\n", __func__);
+		if (!strcmp(info.value.enumerated.name, item))
+			break;
+	}
+	if (i == info.value.enumerated.items) {
+		dev_err(card->dev, "%s has no item %s\n", name, item);
 		return;
 	}
 
 	uctl.id = kctl->id;
-	for (i = 0; i < 2; i++)
-		uctl.value.integer.value[i] = 1;
+	uctl.value.enumerated.item[0] = i;
 
-	if (kctl->put(kctl, &uctl) < 0) {
-		dev_err(card->dev, "failed to enable %s\n", SM8750_TDM_MIXER_CONTROL);
+	if (kctl->put(kctl, &uctl) < 0)
+		dev_err(card->dev, "failed to select %s = %s\n", name, item);
+	else
+		dev_dbg(card->dev, "selected %s = %s\n", name, item);
+}
+
+static void sm8750_mixer_work(struct work_struct *work)
+{
+	struct snd_soc_card *card = sm8750_card_ptr;
+	unsigned int i;
+
+	if (!card)
 		return;
-	}
 
-	dev_dbg(card->dev, "enabled %s\n", SM8750_TDM_MIXER_CONTROL);
+	for (i = 0; i < ARRAY_SIZE(sm8750_mixer_controls); i++)
+		sm8750_ctl_set_bool(card, sm8750_mixer_controls[i]);
+
+	for (i = 0; i < ARRAY_SIZE(sm8750_capture_mixer_controls); i++)
+		sm8750_ctl_set_bool(card, sm8750_capture_mixer_controls[i]);
+
+	for (i = 0; i < ARRAY_SIZE(sm8750_capture_mux_controls); i++)
+		sm8750_ctl_set_enum(card, sm8750_capture_mux_controls[i].name,
+				    sm8750_capture_mux_controls[i].item);
+
+	/* the topology registers its controls asynchronously; retry until the
+	 * last one shows up */
+	if (!snd_soc_card_get_kcontrol(card,
+				       sm8750_mixer_controls[ARRAY_SIZE(sm8750_mixer_controls) - 1]) ||
+	    !snd_soc_card_get_kcontrol(card,
+				       sm8750_capture_mixer_controls[ARRAY_SIZE(sm8750_capture_mixer_controls) - 1]) ||
+	    !snd_soc_card_get_kcontrol(card,
+				       sm8750_capture_mux_controls[ARRAY_SIZE(sm8750_capture_mux_controls) - 1].name)) {
+		if (++sm8750_mixer_tries < SM8750_TDM_MIXER_TRIES)
+			schedule_delayed_work(&sm8750_mixer_work_struct,
+					      msecs_to_jiffies(SM8750_TDM_MIXER_INTERVAL_MS));
+		else
+			dev_warn(card->dev, "%s: capture controls not found\n", __func__);
+	}
 }
 
 static int sm8750_late_probe(struct snd_soc_card *card)
