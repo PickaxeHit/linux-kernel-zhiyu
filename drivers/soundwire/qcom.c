@@ -1265,13 +1265,17 @@ static int qcom_swrm_stream_alloc_ports(struct qcom_swrm_ctrl *ctrl,
 			slave = s_rt->slave;
 			list_for_each_entry(p_rt, &s_rt->port_list, port_node) {
 				m_port = slave->m_port_map[p_rt->num];
-				/* Port numbers start from 1 - 14*/
+				/*
+				 * Data ports are numbered 1..maxport and bit 0 of
+				 * port_mask is reserved so that the free-running
+				 * search below never hands out port 0.
+				 */
 				if (m_port)
 					pn = m_port;
 				else
-					pn = find_first_zero_bit(port_mask, maxport);
+					pn = find_first_zero_bit(port_mask, maxport + 1);
 
-				if (pn >= maxport) {
+				if (pn > maxport) {
 					dev_err(ctrl->dev, "All ports busy\n");
 					return -EBUSY;
 				}

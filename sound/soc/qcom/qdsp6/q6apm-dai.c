@@ -551,11 +551,13 @@ static int q6apm_dai_hw_params(struct snd_soc_component *component,
 	switch (params_format(params)) {
 	case SNDRV_PCM_FORMAT_S16_LE:
 		/*
-		 * The speaker graph runs 32-bit end to end; the shared-memory
-		 * endpoint has to be told the same width or the DSP rejects
-		 * every DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER (write() -> EIO).
+		 * Playback is overridden to 32 bit in q6apm_dai_prepare(): the
+		 * speaker graph runs 32-bit end to end and the DSP rejects every
+		 * DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER otherwise.  Capture must use
+		 * the width the stream sub-graph was built with, or the endpoints
+		 * disagree and the DSP answers every read with zero bytes.
 		 */
-		prtd->bits_per_sample = 32;
+		prtd->bits_per_sample = 16;
 		break;
 	case SNDRV_PCM_FORMAT_S24_LE:
 		prtd->bits_per_sample = 32;
