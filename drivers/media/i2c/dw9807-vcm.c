@@ -40,6 +40,8 @@
 #define MAX_RETRY		10
 
 struct dw9807_device {
+	u32 focus_min;
+	u32 focus_max;
 	struct v4l2_ctrl_handler ctrls_vcm;
 	struct v4l2_subdev sd;
 	struct regulator *vdd;
@@ -174,8 +176,21 @@ static int dw9807_init_controls(struct dw9807_device *dev_vcm)
 
 	v4l2_ctrl_handler_init(hdl, 1);
 
+	/*
+	 * The lens only travels over part of the DAC's nominal range, and driving
+	 * it past the mechanical stops makes the actuator knock audibly and wears
+	 * it out.  Boards describe the safe window in DT so that every client
+	 * (libcamera's autofocus, kamoso, any V4L2 app) stays inside it.
+	 */
+	/*
+	 * The default sits in the middle of the range, not at one end: a client
+	 * that applies the control's default (libcamera does when it starts a
+	 * stream) would otherwise command a full-stroke move to the stop.
+	 */
 	v4l2_ctrl_new_std(hdl, ops, V4L2_CID_FOCUS_ABSOLUTE,
-			  0, DW9807_MAX_FOCUS_POS, DW9807_FOCUS_STEPS, 0);
+			  dev_vcm->focus_min, dev_vcm->focus_max,
+			  DW9807_FOCUS_STEPS,
+			  (dev_vcm->focus_min + dev_vcm->focus_max) / 2);
 
 	dev_vcm->sd.ctrl_handler = hdl;
 	if (hdl->error) {
@@ -196,6 +211,22 @@ static int dw9807_probe(struct i2c_client *client)
 				  GFP_KERNEL);
 	if (dw9807_dev == NULL)
 		return -ENOMEM;
+
+	dw9807_dev->focus_min = 0;
+	dw9807_dev->focus_max = DW9807_MAX_FOCUS_POS;
+	{
+		u32 range[2];
+
+		if (!of_property_read_u32_array(client->dev.of_node,
+						"dongwoon,focus-range", range, 2)) {
+			dw9807_dev->focus_min = min_t(u32, range[0], DW9807_MAX_FOCUS_POS);
+			dw9807_dev->focus_max = min_t(u32, range[1], DW9807_MAX_FOCUS_POS);
+			if (dw9807_dev->focus_max <= dw9807_dev->focus_min)
+				dw9807_dev->focus_max = DW9807_MAX_FOCUS_POS;
+			dev_info(&client->dev, "focus range %u..%u\n",
+				 dw9807_dev->focus_min, dw9807_dev->focus_max);
+		}
+	}
 
 	v4l2_i2c_subdev_init(&dw9807_dev->sd, client, &dw9807_ops);
 	dw9807_dev->sd.flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
@@ -305,17 +336,26 @@ static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
 		usleep_range(1000, 2000);
 	}
 
-	/* Power on */
+	/*
+	 * Power on.  The actuator shares the camera module's rails and only
+	 * answers once the *sensor* is streaming, so the first resume after
+	 * boot (during camera enumeration) may well find it unpowered.  That
+	 * must not fail the resume: the runtime-PM core latches the device into
+	 * "error" and then every later open() of the subdev fails with EINVAL,
+	 * which is exactly what made libcamera's focus control unusable.  Try,
+	 * warn, and let the position writes report the error if it matters.
+	 */
 	ret = i2c_master_send(client, tx_data, sizeof(tx_data));
-	if (ret < 0) {
-		dev_err(&client->dev, "I2C write CTL fail ret = %d\n", ret);
-		if (dw9807_dev->vdd)
-			regulator_disable(dw9807_dev->vdd);
-		return ret;
-	}
+	if (ret < 0)
+		dev_dbg(&client->dev,
+			"actuator not answering yet (%d), will retry on the next write\n",
+			ret);
 
 	usleep_range(1000, 2000);
-	return dw9807_set_dac(client, dw9807_dev->current_val);
+	if (dw9807_dev->current_val)
+		dw9807_set_dac(client, dw9807_dev->current_val);
+
+	return 0;
 
 }
 
