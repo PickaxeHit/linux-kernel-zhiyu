@@ -394,26 +394,43 @@ static void sm8750_mixer_work(struct work_struct *work)
 		sm8750_ctl_set_enum(card, sm8750_capture_mux_controls[i].name,
 				    sm8750_capture_mux_controls[i].item);
 
-	/* the topology registers its controls asynchronously; retry until the
-	 * last one shows up */
-	if (!snd_soc_card_get_kcontrol(card,
-				       sm8750_mixer_controls[ARRAY_SIZE(sm8750_mixer_controls) - 1]) ||
-	    !snd_soc_card_get_kcontrol(card,
-				       sm8750_capture_mixer_controls[ARRAY_SIZE(sm8750_capture_mixer_controls) - 1]) ||
-	    !snd_soc_card_get_kcontrol(card,
-				       sm8750_capture_mux_controls[ARRAY_SIZE(sm8750_capture_mux_controls) - 1].name)) {
-		if (++sm8750_mixer_tries < SM8750_TDM_MIXER_TRIES)
-			schedule_delayed_work(&sm8750_mixer_work_struct,
-					      msecs_to_jiffies(SM8750_TDM_MIXER_INTERVAL_MS));
-		else
-			dev_warn(card->dev, "%s: capture controls not found\n", __func__);
+	/*
+	 * Components and the topology register their controls at different
+	 * points of the card bind, so keep applying the whole set for a while
+	 * instead of guessing when the last one showed up.
+	 */
+	if (++sm8750_mixer_tries < SM8750_TDM_MIXER_TRIES) {
+		schedule_delayed_work(&sm8750_mixer_work_struct,
+				      msecs_to_jiffies(SM8750_TDM_MIXER_INTERVAL_MS));
+		return;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(sm8750_capture_mux_controls); i++) {
+		if (!snd_soc_card_get_kcontrol(card, sm8750_capture_mux_controls[i].name))
+			dev_warn(card->dev, "%s: %s not registered\n", __func__,
+				 sm8750_capture_mux_controls[i].name);
 	}
 }
 
 static int sm8750_late_probe(struct snd_soc_card *card)
 {
+	unsigned int i;
+
 	sm8750_card_ptr = card;
 	sm8750_mixer_tries = 0;
+
+	/*
+	 * The VA macro is a plain ASoC component, so its controls exist by the
+	 * time the card binds: set the capture path here instead of racing the
+	 * topology controls in the delayed work.
+	 */
+	for (i = 0; i < ARRAY_SIZE(sm8750_capture_mixer_controls); i++)
+		sm8750_ctl_set_bool(card, sm8750_capture_mixer_controls[i]);
+
+	for (i = 0; i < ARRAY_SIZE(sm8750_capture_mux_controls); i++)
+		sm8750_ctl_set_enum(card, sm8750_capture_mux_controls[i].name,
+				    sm8750_capture_mux_controls[i].item);
+
 	schedule_delayed_work(&sm8750_mixer_work_struct,
 			      msecs_to_jiffies(SM8750_TDM_MIXER_INTERVAL_MS));
 	return 0;
