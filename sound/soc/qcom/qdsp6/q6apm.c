@@ -1088,6 +1088,31 @@ static int q6apm_graph_get_module_iid(struct q6apm_graph *graph, uint32_t mid)
 	return module->instance_id;
 }
 
+static LIST_HEAD(open_graphs);
+static DEFINE_MUTEX(open_graphs_lock);
+
+/*
+ * A backend DAI cannot hold on to the frontend's q6apm_graph pointer, but in
+ * single-graph topologies it has to configure modules that live in the
+ * frontend's graph.  Keep a small registry of open graphs so it can find that
+ * graph by id instead of opening a second, empty one.
+ */
+struct q6apm_graph *q6apm_get_graph_by_id(int graph_id)
+{
+	struct q6apm_graph *graph = NULL;
+
+	mutex_lock(&open_graphs_lock);
+	list_for_each_entry(graph, &open_graphs, node) {
+		if (graph->id == graph_id)
+			goto out;
+	}
+	graph = NULL;
+out:
+	mutex_unlock(&open_graphs_lock);
+	return graph;
+}
+EXPORT_SYMBOL_GPL(q6apm_get_graph_by_id);
+
 struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
 				     void *priv, int graph_id, int dir)
 {
@@ -1143,6 +1168,10 @@ struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
 		goto free_graph;
 	}
 
+	mutex_lock(&open_graphs_lock);
+	list_add_tail(&graph->node, &open_graphs);
+	mutex_unlock(&open_graphs_lock);
+
 	return graph;
 
 free_graph:
@@ -1156,6 +1185,10 @@ EXPORT_SYMBOL_GPL(q6apm_graph_open);
 int q6apm_graph_close(struct q6apm_graph *graph)
 {
 	struct audioreach_graph *ar_graph = graph->ar_graph;
+
+	mutex_lock(&open_graphs_lock);
+	list_del(&graph->node);
+	mutex_unlock(&open_graphs_lock);
 
 	graph->ar_graph = NULL;
 	kref_put(&ar_graph->refcount, q6apm_put_audioreach_graph);

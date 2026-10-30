@@ -278,6 +278,25 @@ MODULE_PARM_DESC(be_graph_id, "graph-info id for backend DAIs (-1 = DAI index)")
 
 MODULE_PARM_DESC(be_graph_id, "graph-info id for backend DAIs (-1 = DAI index)");
 
+/*
+ * Frontend graph id that owns the capture device sub-graph in single-graph
+ * mode.  The capture stream sub-graph and its device sub-graph share the
+ * frontend's graph (the PCM's DAI index in the topology), so the backend only
+ * has to push the device media format into that graph - it must not open or
+ * start a graph of its own.
+ */
+static int be_capture_graph_id = 2;
+module_param(be_capture_graph_id, int, 0644);
+MODULE_PARM_DESC(be_capture_graph_id,
+		 "frontend graph id owning the capture device sub-graph (single-graph mode)");
+
+/* Codec-DMA capture DAIs: the microphones (VA/TX macro) and the WCD TX paths. */
+static bool q6apm_lpass_dai_is_dma_capture(int id)
+{
+	return (id >= VA_CODEC_DMA_TX_0 && id <= VA_CODEC_DMA_TX_2) ||
+	       (id >= TX_CODEC_DMA_TX_0 && id <= TX_CODEC_DMA_TX_5);
+}
+
 static int q6apm_lpass_dai_graph_id(struct snd_soc_dai *dai)
 {
 	return be_graph_id >= 0 ? be_graph_id : dai->id;
@@ -394,6 +413,13 @@ static int q6apm_lpass_dai_trigger(struct snd_pcm_substream *substream, int cmd,
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		if (!dai_data->is_port_started[dai->id]) {
+			if (be_start_mode == 3 &&
+			    substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+			    q6apm_lpass_dai_is_dma_capture(dai->id)) {
+				/* started together with the frontend graph */
+				dai_data->is_port_started[dai->id] = true;
+				break;
+			}
 			if ((be_start_mode == 0 || be_start_mode == 3) &&
 			    dai_data->graph[dai->id] &&
 			    (dai->id >= PRIMARY_TDM_RX_0 && dai->id <= QUINARY_TDM_TX_7)) {
@@ -490,6 +516,25 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 		return 0;
 	}
 
+	/*
+	 * Single-graph capture: the frontend opened frontend graph
+	 * be_capture_graph_id and will prepare and start it.  All this backend
+	 * has to do is configure the codec-DMA module inside that graph with
+	 * the device-side format, exactly like the TDM playback backend does
+	 * for its own device sub-graph.
+	 */
+	if (be_start_mode == 3 && substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+	    q6apm_lpass_dai_is_dma_capture(dai->id)) {
+		graph = q6apm_get_graph_by_id(be_capture_graph_id);
+		if (!graph) {
+			dev_err(dai->dev, "port %d: frontend graph %d not open\n",
+				dai->id, be_capture_graph_id);
+			return -EPIPE;
+		}
+		cfg->direction = substream->stream;
+		return q6apm_graph_media_format_device(graph, cfg);
+	}
+
 	/**
 	 * It is recommend to load DSP with source graph first and then sink
 	 * graph, so sequence for playback and capture will be different
@@ -530,6 +575,12 @@ static int q6apm_lpass_dai_startup(struct snd_pcm_substream *substream, struct s
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
 	struct q6apm_graph *graph;
 	int graph_id = dai->id;
+
+	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE &&
+	    be_start_mode == 3 && q6apm_lpass_dai_is_dma_capture(dai->id)) {
+		/* the frontend graph carries the whole capture pipeline */
+		return 0;
+	}
 
 	if (substream->stream == SNDRV_PCM_STREAM_CAPTURE) {
 		graph = q6apm_graph_open(dai->dev, NULL, dai->dev, graph_id, substream->stream);

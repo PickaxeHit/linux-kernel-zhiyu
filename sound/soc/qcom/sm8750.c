@@ -82,6 +82,17 @@ SND_SOC_DAILINK_DEFS(tdm_be,
 		     DAILINK_COMP_ARRAY(COMP_PLATFORM("q6apm-lpass-dais")));
 
 /*
+ * The two microphones are DMIC, clocked by the VA macro and read through the
+ * LPASS codec DMA (VA_CODEC_DMA_TX_0).  The topology owns the capture graph;
+ * this link only has to bind the DSP backend to the macro so the macro is
+ * clocked and its DMIC inputs are powered.
+ */
+SND_SOC_DAILINK_DEFS(va_capture,
+		     DAILINK_COMP_ARRAY(COMP_CPU("VA_CODEC_DMA_TX_0")),
+		     DAILINK_COMP_ARRAY(COMP_CODEC("7660000.codec", "va_macro_tx1")),
+		     DAILINK_COMP_ARRAY(COMP_PLATFORM("q6apm-lpass-dais")));
+
+/*
  * Vendor resources put the speakers on a 4-slot TDM frame; each amp receives
  * exactly one slot.  Configure both the LPASS side (when the DAI exposes the
  * op) and the codec side from the same numbers.
@@ -232,6 +243,19 @@ static struct snd_soc_dai_link sm8750_dai_links[] = {
 		.be_hw_params_fixup = sm8750_be_hw_params_fixup,
 		SND_SOC_DAILINK_REG(tdm_be),
 	},
+	{
+		.name = "VA Capture",
+		/*
+		 * Must match the capture stream name of the device sub-graph in
+		 * the topology ("<DEVICE> Capture"): that widget is what the
+		 * topology's capture route connects the stream mixer to, and
+		 * DPCM finds backends through exactly that DAPM path.
+		 */
+		.stream_name = "VA_CODEC_DMA_TX_0 Capture",
+		/* pure DPCM backend: the topology's capture PCM drives it */
+		.no_pcm = 1,
+		SND_SOC_DAILINK_REG(va_capture),
+	},
 };
 
 /*
@@ -257,7 +281,12 @@ static struct snd_soc_aux_dev sm8750_aux_devs[] = {
  * has been registered with the card, which happens after late_probe(), so poll
  * for it from a delayed work instead of racing the card registration.
  */
-#define SM8750_TDM_MIXER_CONTROL "SECONDARY_TDM_RX_0 Audio Mixer MultiMedia1"
+static const char * const sm8750_mixer_controls[] = {
+	/* stream sub-graph -> speaker TDM device sub-graph */
+	"SECONDARY_TDM_RX_0 Audio Mixer MultiMedia1",
+	/* stream sub-graph -> DMIC capture device sub-graph */
+	"MultiMedia3 Mixer VA_CODEC_DMA_TX_0",
+};
 #define SM8750_TDM_MIXER_TRIES 25
 #define SM8750_TDM_MIXER_INTERVAL_MS 200
 
@@ -272,32 +301,38 @@ static void sm8750_mixer_work(struct work_struct *work)
 	struct snd_ctl_elem_value uctl = { 0 };
 	struct snd_kcontrol *kctl;
 	struct snd_soc_card *card = sm8750_card_ptr;
-	int i;
+	unsigned int i;
+	int c;
 
 	if (!card)
 		return;
 
-	kctl = snd_soc_card_get_kcontrol(card, SM8750_TDM_MIXER_CONTROL);
-	if (!kctl) {
-		if (++sm8750_mixer_tries < SM8750_TDM_MIXER_TRIES) {
+	for (i = 0; i < ARRAY_SIZE(sm8750_mixer_controls); i++) {
+		kctl = snd_soc_card_get_kcontrol(card, sm8750_mixer_controls[i]);
+		if (!kctl)
+			continue;
+
+		uctl.id = kctl->id;
+		for (c = 0; c < 2; c++)
+			uctl.value.integer.value[c] = 1;
+
+		if (kctl->put(kctl, &uctl) < 0)
+			dev_err(card->dev, "failed to enable %s\n",
+				sm8750_mixer_controls[i]);
+		else
+			dev_dbg(card->dev, "enabled %s\n", sm8750_mixer_controls[i]);
+	}
+
+	/* the topology registers its controls asynchronously; retry until the
+	 * last one shows up */
+	if (!snd_soc_card_get_kcontrol(card,
+				       sm8750_mixer_controls[ARRAY_SIZE(sm8750_mixer_controls) - 1])) {
+		if (++sm8750_mixer_tries < SM8750_TDM_MIXER_TRIES)
 			schedule_delayed_work(&sm8750_mixer_work_struct,
 					      msecs_to_jiffies(SM8750_TDM_MIXER_INTERVAL_MS));
-			return;
-		}
-		dev_warn(card->dev, "%s: control not found\n", __func__);
-		return;
+		else
+			dev_warn(card->dev, "%s: capture control not found\n", __func__);
 	}
-
-	uctl.id = kctl->id;
-	for (i = 0; i < 2; i++)
-		uctl.value.integer.value[i] = 1;
-
-	if (kctl->put(kctl, &uctl) < 0) {
-		dev_err(card->dev, "failed to enable %s\n", SM8750_TDM_MIXER_CONTROL);
-		return;
-	}
-
-	dev_dbg(card->dev, "enabled %s\n", SM8750_TDM_MIXER_CONTROL);
 }
 
 static int sm8750_late_probe(struct snd_soc_card *card)
@@ -404,6 +439,37 @@ static int sm8750_platform_probe(struct platform_device *pdev)
 			dev_dbg(&pdev->dev, "using q6apm bedais node %pOF\n", np);
 		} else {
 			dev_warn(&pdev->dev, "q6apm bedais node not found\n");
+		}
+	}
+
+	/*
+	 * The capture backend uses the same LPASS DAI component; its codec side
+	 * is the VA macro, which also has to be matched by OF node because the
+	 * component is named after the platform device.
+	 */
+	{
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(sm8750_dai_links); i++) {
+			struct snd_soc_dai_link *link = &sm8750_dai_links[i];
+
+			if (strcmp(link->name, "VA Capture"))
+				continue;
+
+			np = of_find_node_by_path("/soc@0/remoteproc@6800000/glink-edge/gpr/service@1/bedais");
+			if (np) {
+				link->platforms[0].of_node = np;
+				link->platforms[0].name = NULL;
+			}
+
+			np = of_find_node_by_path("/soc@0/codec@7660000");
+			if (np) {
+				link->codecs[0].of_node = np;
+				link->codecs[0].name = NULL;
+				link->codecs[0].dai_name = "va_macro_tx1";
+			} else {
+				dev_warn(&pdev->dev, "VA macro node not found\n");
+			}
 		}
 	}
 

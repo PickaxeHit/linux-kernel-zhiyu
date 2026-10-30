@@ -110,11 +110,14 @@ struct q6apm_graph {
 	struct mutex lock;
 	struct audioreach_graph *ar_graph;
 	struct audioreach_graph_info *info;
+	/* registry of open graphs, so a backend can reach the frontend's graph */
+	struct list_head node;
 };
 
 /* Graph Operations */
 struct q6apm_graph *q6apm_graph_open(struct device *dev, q6apm_cb cb,
 				     void *priv, int graph_id, int dir);
+struct q6apm_graph *q6apm_get_graph_by_id(int graph_id);
 int q6apm_graph_close(struct q6apm_graph *graph);
 int q6apm_graph_prepare(struct q6apm_graph *graph);
 int q6apm_graph_start(struct q6apm_graph *graph);
