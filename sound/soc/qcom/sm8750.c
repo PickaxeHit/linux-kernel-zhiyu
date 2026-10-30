@@ -423,13 +423,13 @@ static const struct {
 	const char *item;
 } sm8750_capture_mux_controls[] = {
 	{ "TX0 MODE", "ADC_LP" },
-	{ "TX2 MODE", "ADC_LP" },
+	{ "TX1 MODE", "ADC_LP" },
 	{ "ADC1 MUX", "CH1_AMIC1" },
 	{ "ADC3 MUX", "CH3_AMIC4" },
 	{ "TX DEC0 MUX", "SWR_MIC" },
 	{ "TX DEC1 MUX", "SWR_MIC" },
 	{ "TX SMIC MUX0", "SWR_MIC4" },
-	{ "TX SMIC MUX1", "SWR_MIC8" },
+	{ "TX SMIC MUX1", "SWR_MIC6" },
 };
 
 static const struct {
@@ -596,13 +596,19 @@ static int sm8750_late_probe(struct snd_soc_card *card)
  * Capture path of the built-in microphones.  The analog AMIC1/AMIC4 inputs of
  * the WCD939x are biased by its own mic bias supplies, and the codec's ADC
  * outputs feed the TX macro's SoundWire inputs, which the SMIC muxes select
- * (SWR_MIC4 / SWR_MIC8).
+ * (SWR_MIC4 for ADC1, SWR_MIC6 for ADC3).
+ *
+ * All four codec ADCs leave the WCD939x on its first SoundWire data port, as
+ * consecutive channels of that port, which is also what the codec does when
+ * its TX channel map is left at the reset value.  The TX macro numbers the
+ * SoundWire inputs four per data port starting at the second port, so ADC1
+ * (channel 1) is SWR_MIC4 and ADC3 (channel 3) is SWR_MIC6.
  */
 static const struct snd_soc_dapm_route sm8750_audio_routes[] = {
 	{ "AMIC1", NULL, "MIC BIAS1" },
 	{ "AMIC4", NULL, "MIC BIAS4" },
 	{ "TX SWR_INPUT4", NULL, "ADC1_OUTPUT" },
-	{ "TX SWR_INPUT8", NULL, "ADC3_OUTPUT" },
+	{ "TX SWR_INPUT6", NULL, "ADC3_OUTPUT" },
 };
 
 static struct snd_soc_card sm8750_card = {
