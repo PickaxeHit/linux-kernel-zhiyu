@@ -16,6 +16,7 @@
 #include <sound/pcm_params.h>
 
 #include "qdsp6/q6prm.h"
+#include "sdw.h"
 
 /*
  * The q6apm-dai component registers no DAIs of its own (it is a DPCM
@@ -226,6 +227,41 @@ static int sm8750_be_hw_params_fixup(struct snd_soc_pcm_runtime *rtd,
 	return 0;
 }
 
+#define SM8750_MAX_LINKS 8
+
+static bool sm8750_stream_prepared[SM8750_MAX_LINKS];
+
+static int sm8750_snd_prepare(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+
+	return qcom_snd_sdw_prepare(substream,
+				    &sm8750_stream_prepared[cpu_dai->id]);
+}
+
+static int sm8750_snd_hw_free(struct snd_pcm_substream *substream)
+{
+	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
+	struct snd_soc_dai *cpu_dai = snd_soc_rtd_to_cpu(rtd, 0);
+
+	return qcom_snd_sdw_hw_free(substream,
+				    &sm8750_stream_prepared[cpu_dai->id]);
+}
+
+/*
+ * The capture backend is reached through the SoundWire link between the codec
+ * and the TX macro, so the SoundWire stream has to be allocated at startup and
+ * handed to every codec DAI - without it the codec has no stream runtime when
+ * hw_params runs.
+ */
+static const struct snd_soc_ops sm8750_capture_ops = {
+	.startup = qcom_snd_sdw_startup,
+	.shutdown = qcom_snd_sdw_shutdown,
+	.prepare = sm8750_snd_prepare,
+	.hw_free = sm8750_snd_hw_free,
+};
+
 static struct snd_soc_dai_link sm8750_dai_links[] = {
 	{
 		.name = "APM Playback",
@@ -262,6 +298,7 @@ static struct snd_soc_dai_link sm8750_dai_links[] = {
 		.stream_name = "TX_CODEC_DMA_TX_3 Capture",
 		/* pure DPCM backend: the topology's capture PCM drives it */
 		.no_pcm = 1,
+		.ops = &sm8750_capture_ops,
 		SND_SOC_DAILINK_REG(wcd_capture),
 	},
 };
