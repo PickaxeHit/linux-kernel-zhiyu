@@ -525,7 +525,13 @@ static snd_pcm_uframes_t q6apm_dai_pointer(struct snd_soc_component *component,
 		ptr = bytes_to_frames(runtime, index);
 		return ptr;
 	}
-	ptr = q6apm_get_hw_pointer(prtd->graph, substream->stream) * runtime->period_size;
+	{
+		int hw = q6apm_get_hw_pointer(prtd->graph, substream->stream);
+
+		pr_debug_ratelimited("ar-ptr: graph %px hw %d period %lu\n",
+				     prtd->graph, hw, (unsigned long)runtime->period_size);
+		ptr = hw * runtime->period_size;
+	}
 	if (ptr)
 		return ptr - 1;
 
