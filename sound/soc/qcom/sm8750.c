@@ -299,6 +299,30 @@ static int sm8750_capture_hw_params(struct snd_pcm_substream *substream,
 	return 0;
 }
 
+/*
+ * Pin the capture backend's wire format instead of letting DPCM hand the
+ * frontend's parameters down: the codec-DMA module takes its channel count
+ * and sample width from the backend, and the reference port does the same
+ * (mainline's sm8450 machine driver forces 48000 / S16_LE / 2 channels on
+ * every codec-DMA capture backend).
+ */
+static int sm8750_capture_be_fixup(struct snd_soc_pcm_runtime *rtd,
+				   struct snd_pcm_hw_params *params)
+{
+	struct snd_interval *rate = hw_param_interval(params,
+						      SNDRV_PCM_HW_PARAM_RATE);
+	struct snd_interval *channels = hw_param_interval(params,
+							  SNDRV_PCM_HW_PARAM_CHANNELS);
+	struct snd_mask *fmt = hw_param_mask(params, SNDRV_PCM_HW_PARAM_FORMAT);
+
+	rate->min = rate->max = 48000;
+	channels->min = channels->max = 2;
+	snd_mask_none(fmt);
+	snd_mask_set_format(fmt, SNDRV_PCM_FORMAT_S16_LE);
+
+	return 0;
+}
+
 static const struct snd_soc_ops sm8750_capture_ops = {
 	.startup = qcom_snd_sdw_startup,
 	.shutdown = qcom_snd_sdw_shutdown,
@@ -343,6 +367,7 @@ static struct snd_soc_dai_link sm8750_dai_links[] = {
 		.stream_name = "TX_CODEC_DMA_TX_3 Capture",
 		/* pure DPCM backend: the topology's capture PCM drives it */
 		.no_pcm = 1,
+		.be_hw_params_fixup = sm8750_capture_be_fixup,
 		.ops = &sm8750_capture_ops,
 		SND_SOC_DAILINK_REG(wcd_capture),
 	},
