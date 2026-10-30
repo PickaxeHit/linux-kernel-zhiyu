@@ -1163,6 +1163,60 @@ static bool fe_be_conn = true;
 module_param(fe_be_conn, bool, 0644);
 MODULE_PARM_DESC(fe_be_conn, "put the FE->BE module connection into the BE GRAPH_OPEN payload");
 
+/* The stream sub-graph carries the shared-memory endpoint, a device sub-graph never does. */
+static bool audioreach_info_has_stream(const struct audioreach_graph_info *info)
+{
+	const struct audioreach_sub_graph *sg;
+	const struct audioreach_container *cont;
+	const struct audioreach_module *mod;
+
+	list_for_each_entry(sg, &info->sg_list, node) {
+		list_for_each_entry(cont, &sg->container_list, node) {
+			list_for_each_entry(mod, &cont->modules_list, node) {
+				switch (mod->module_id) {
+				case MODULE_ID_WR_SHARED_MEM_EP:
+				case MODULE_ID_RD_SHARED_MEM_EP:
+				case MODULE_ID_SH_MEM_PULL_MODE:
+				case MODULE_ID_SH_MEM_PUSH_MODE:
+					return true;
+				}
+			}
+		}
+	}
+
+	return false;
+}
+
+/*
+ * The stream->device connection has to travel in the GRAPH_OPEN payload of the
+ * backend graph: that is the graph the source module of a recording starts in,
+ * and a device graph whose modules are not connected to anything is refused by
+ * the DSP on GRAPH_START (0x01001002).
+ *
+ * Which of the two modules a mixer control connects belongs to the backend
+ * depends on the direction: for playback the control sits on the stream
+ * sub-graph and its DAPM widget on the device sub-graph, for capture it is the
+ * other way round.  Rather than depending on that, put the connection on the
+ * graph that has no shared-memory endpoint - the backend - and keep the module
+ * order the control defines (m1 -> m2).
+ */
+static struct audioreach_graph_info *
+audioreach_connection_graph(struct q6apm *apm,
+			    const struct snd_ar_control *m1,
+			    const struct snd_ar_control *m2)
+{
+	struct audioreach_graph_info *info1, *info2;
+
+	info1 = idr_find(&apm->graph_info_idr, m1->graph_id);
+	info2 = idr_find(&apm->graph_info_idr, m2->graph_id);
+
+	if (info1 && info1 != info2 && !audioreach_info_has_stream(info1) &&
+	    info2 && audioreach_info_has_stream(info2))
+		return info1;
+
+	return info2;
+}
+
 static void audioreach_connect_sub_graphs(struct q6apm *apm,
 					  const struct snd_ar_control *m1,
 					  const struct snd_ar_control *m2,
@@ -1171,8 +1225,11 @@ static void audioreach_connect_sub_graphs(struct q6apm *apm,
 	struct audioreach_graph_info *info;
 
 	mutex_lock(&apm->lock);
-	info = idr_find(&apm->graph_info_idr, m2->graph_id);
+	info = audioreach_connection_graph(apm, m1, m2);
 	mutex_unlock(&apm->lock);
+
+	if (!info)
+		return;
 
 	if (connect && fe_be_conn) {
 		info->src_mod_inst_id = m1->module_instance_id;
@@ -1199,8 +1256,11 @@ static bool audioreach_is_vmixer_connected(struct q6apm *apm,
 	const struct audioreach_graph_info *info;
 
 	mutex_lock(&apm->lock);
-	info = idr_find(&apm->graph_info_idr, m2->graph_id);
+	info = audioreach_connection_graph(apm, m1, m2);
 	mutex_unlock(&apm->lock);
+
+	if (!info)
+		return false;
 
 	if (info->dst_mod_inst_id == m2->module_instance_id &&
 	    info->src_mod_inst_id == m1->module_instance_id)
