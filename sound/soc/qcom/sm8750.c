@@ -87,9 +87,17 @@ SND_SOC_DAILINK_DEFS(tdm_be,
  * this link only has to bind the DSP backend to the macro so the macro is
  * clocked and its DMIC inputs are powered.
  */
-SND_SOC_DAILINK_DEFS(tx_capture,
+/*
+ * The built-in microphones are the analog AMIC inputs of the WCD939x: the
+ * codec digitises them and sends them over the LPASS TX SoundWire master into
+ * the TX macro's SMIC inputs, so the capture backend is the TX codec DMA and
+ * the link needs the codec, the SoundWire master and the macro as codecs.
+ */
+SND_SOC_DAILINK_DEFS(wcd_capture,
 		     DAILINK_COMP_ARRAY(COMP_CPU("TX_CODEC_DMA_TX_3")),
-		     DAILINK_COMP_ARRAY(COMP_CODEC("6ae0000.codec", "tx_macro_tx1")),
+		     DAILINK_COMP_ARRAY(COMP_CODEC("audio-codec", "wcd939x-sdw-tx"),
+					COMP_CODEC("soundwire@7630000", "SDW Pin0"),
+					COMP_CODEC("6ae0000.codec", "tx_macro_tx1")),
 		     DAILINK_COMP_ARRAY(COMP_PLATFORM("q6apm-lpass-dais")));
 
 /*
@@ -244,7 +252,7 @@ static struct snd_soc_dai_link sm8750_dai_links[] = {
 		SND_SOC_DAILINK_REG(tdm_be),
 	},
 	{
-		.name = "TX Capture",
+		.name = "WCD Capture",
 		/*
 		 * Must match the capture stream name of the device sub-graph in
 		 * the topology ("<DEVICE> Capture"): that widget is what the
@@ -254,7 +262,7 @@ static struct snd_soc_dai_link sm8750_dai_links[] = {
 		.stream_name = "TX_CODEC_DMA_TX_3 Capture",
 		/* pure DPCM backend: the topology's capture PCM drives it */
 		.no_pcm = 1,
-		SND_SOC_DAILINK_REG(tx_capture),
+		SND_SOC_DAILINK_REG(wcd_capture),
 	},
 };
 
@@ -289,27 +297,66 @@ static const char * const sm8750_mixer_controls[] = {
 };
 
 /*
- * TX macro capture path: the built-in microphones are DMIC mics wired to the
- * TX macro, so DEC2 has to feed AIF1 and its DMIC mux has to select DMIC2 -
- * the stock "dmic3" mixer path, which the vendor machine driver applies for
- * its handset-mic device.  These are userspace (UCM) controls on that stack;
- * here the machine driver owns them.
+ * Capture path of the built-in microphones.  They are the analog AMIC1/AMIC4
+ * inputs of the WCD939x: the codec digitises them and feeds them into the TX
+ * macro's SMIC inputs over SoundWire, so the decimators have to be switched to
+ * the SoundWire microphones and their inputs to the codec's ADC ports.
  */
 static const char * const sm8750_capture_mixer_controls[] = {
-	"TX_AIF1_CAP Mixer DEC2",
+	"ADC1 Switch",
+	"ADC3 Switch",
+	"ADC1_MIXER Switch",
+	"ADC3_MIXER Switch",
+	"TX_AIF1_CAP Mixer DEC0",
+	"TX_AIF1_CAP Mixer DEC1",
 };
 
 static const struct {
 	const char *name;
 	const char *item;
 } sm8750_capture_mux_controls[] = {
-	{ "TX DMIC MUX2", "DMIC2" },
+	{ "TX0 MODE", "ADC_LP" },
+	{ "TX2 MODE", "ADC_LP" },
+	{ "ADC1 MUX", "CH1_AMIC1" },
+	{ "ADC3 MUX", "CH3_AMIC4" },
+	{ "TX DEC0 MUX", "SWR_MIC" },
+	{ "TX DEC1 MUX", "SWR_MIC" },
+	{ "TX SMIC MUX0", "SWR_MIC4" },
+	{ "TX SMIC MUX1", "SWR_MIC8" },
+};
+
+static const struct {
+	const char *name;
+	unsigned int value;
+} sm8750_capture_volume_controls[] = {
+	{ "ADC1 Volume", 12 },
+	{ "ADC3 Volume", 12 },
+	{ "TX_DEC0 Volume", 84 },
+	{ "TX_DEC1 Volume", 84 },
 };
 #define SM8750_TDM_MIXER_TRIES 25
 #define SM8750_TDM_MIXER_INTERVAL_MS 200
 
 static struct snd_soc_card *sm8750_card_ptr;
 static int sm8750_mixer_tries;
+
+static void sm8750_ctl_set_int(struct snd_soc_card *card, const char *name,
+			       unsigned int value)
+{
+	struct snd_ctl_elem_value uctl = { 0 };
+	struct snd_kcontrol *kctl = snd_soc_card_get_kcontrol(card, name);
+
+	if (!kctl)
+		return;
+
+	uctl.id = kctl->id;
+	uctl.value.integer.value[0] = value;
+
+	if (kctl->put(kctl, &uctl) < 0)
+		dev_err(card->dev, "failed to set %s = %u\n", name, value);
+	else
+		dev_dbg(card->dev, "set %s = %u\n", name, value);
+}
 
 static void sm8750_mixer_work(struct work_struct *work);
 static DECLARE_DELAYED_WORK(sm8750_mixer_work_struct, sm8750_mixer_work);
@@ -387,6 +434,10 @@ static void sm8750_mixer_work(struct work_struct *work)
 
 	for (i = 0; i < ARRAY_SIZE(sm8750_capture_mixer_controls); i++)
 		sm8750_ctl_set_bool(card, sm8750_capture_mixer_controls[i]);
+
+	for (i = 0; i < ARRAY_SIZE(sm8750_capture_volume_controls); i++)
+		sm8750_ctl_set_int(card, sm8750_capture_volume_controls[i].name,
+				   sm8750_capture_volume_controls[i].value);
 
 	for (i = 0; i < ARRAY_SIZE(sm8750_capture_mux_controls); i++)
 		sm8750_ctl_set_enum(card, sm8750_capture_mux_controls[i].name,
@@ -533,17 +584,25 @@ static int sm8750_platform_probe(struct platform_device *pdev)
 	}
 
 	/*
-	 * The capture backend uses the same LPASS DAI component and the TX
-	 * macro; both have to be matched by OF node because their components
-	 * are named after the platform device, not after the DT node.
+	 * The capture backend uses the same LPASS DAI component, and all three
+	 * codecs have to be matched by OF node because their components are
+	 * named after the platform device rather than after the DT node.
 	 */
 	{
-		unsigned int i;
+		static const struct {
+			const char *path;
+			const char *dai;
+		} capture_codecs[] = {
+			{ "/audio-codec", "wcd939x-sdw-tx" },
+			{ "/soc@0/soundwire@7630000", "SDW Pin0" },
+			{ "/soc@0/codec@6ae0000", "tx_macro_tx1" },
+		};
+		unsigned int i, c;
 
 		for (i = 0; i < ARRAY_SIZE(sm8750_dai_links); i++) {
 			struct snd_soc_dai_link *link = &sm8750_dai_links[i];
 
-			if (strcmp(link->name, "TX Capture"))
+			if (strcmp(link->name, "WCD Capture"))
 				continue;
 
 			np = of_find_node_by_path("/soc@0/remoteproc@6800000/glink-edge/gpr/service@1/bedais");
@@ -554,13 +613,16 @@ static int sm8750_platform_probe(struct platform_device *pdev)
 				dev_warn(&pdev->dev, "LPASS bedais node not found\n");
 			}
 
-			np = of_find_node_by_path("/soc@0/codec@6ae0000");
-			if (np) {
-				link->codecs[0].of_node = np;
-				link->codecs[0].name = NULL;
-				link->codecs[0].dai_name = "tx_macro_tx1";
-			} else {
-				dev_warn(&pdev->dev, "TX macro node not found\n");
+			for (c = 0; c < ARRAY_SIZE(capture_codecs); c++) {
+				np = of_find_node_by_path(capture_codecs[c].path);
+				if (!np) {
+					dev_warn(&pdev->dev, "%s not found\n",
+						 capture_codecs[c].path);
+					continue;
+				}
+				link->codecs[c].of_node = np;
+				link->codecs[c].name = NULL;
+				link->codecs[c].dai_name = capture_codecs[c].dai;
 			}
 		}
 	}
