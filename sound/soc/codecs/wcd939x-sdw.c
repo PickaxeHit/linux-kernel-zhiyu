@@ -136,7 +136,7 @@ int wcd939x_sdw_hw_params(struct wcd939x_sdw_priv *wcd,
 	unsigned long ch_mask;
 	int i, j;
 
-	wcd->sconfig.ch_count = 1;
+	wcd->sconfig.ch_count = 0;
 	wcd->active_ports = 0;
 	for (i = 0; i < WCD939X_MAX_SWR_PORTS; i++) {
 		ch_mask = wcd->port_config[i].ch_mask;
@@ -159,6 +159,11 @@ int wcd939x_sdw_hw_params(struct wcd939x_sdw_priv *wcd,
 		wcd->sconfig.direction = SDW_DATA_DIR_RX;
 
 	wcd->sconfig.type = SDW_STREAM_PCM;
+
+	dev_info(&wcd->sdev->dev, "zy-wcd: hw_params dir %d ch %d bps %d rate %d ports %d%s\n",
+		 wcd->sconfig.direction, wcd->sconfig.ch_count, wcd->sconfig.bps,
+		 wcd->sconfig.frame_rate, wcd->active_ports,
+		 wcd->is_tx ? " tx" : " rx");
 
 	return sdw_stream_add_slave(wcd->sdev, &wcd->sconfig, &port_config[0],
 				    wcd->active_ports, wcd->sruntime);
