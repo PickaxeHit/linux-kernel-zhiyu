@@ -438,8 +438,12 @@ static const struct {
 } sm8750_capture_volume_controls[] = {
 	{ "ADC1 Volume", 12 },
 	{ "ADC3 Volume", 12 },
-	{ "TX_DEC0 Volume", 84 },
-	{ "TX_DEC1 Volume", 84 },
+	/* Decimator gain is 1 dB per step with -84 dB at 0, so 102 is +18 dB:
+	 * the vendor's unprocessed capture path uses that value, and it lifts the
+	 * microphones' own noise floor to about -50 dBFS with taps near
+	 * -11 dBFS, instead of a -66 dBFS floor at 0 dB. */
+	{ "TX_DEC0 Volume", 102 },
+	{ "TX_DEC1 Volume", 102 },
 };
 #define SM8750_TDM_MIXER_TRIES 25
 #define SM8750_TDM_MIXER_INTERVAL_MS 200
