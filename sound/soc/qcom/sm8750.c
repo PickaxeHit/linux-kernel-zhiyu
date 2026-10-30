@@ -522,6 +522,19 @@ static int sm8750_late_probe(struct snd_soc_card *card)
 	return 0;
 }
 
+/*
+ * Capture path of the built-in microphones.  The analog AMIC1/AMIC4 inputs of
+ * the WCD939x are biased by its own mic bias supplies, and the codec's ADC
+ * outputs feed the TX macro's SoundWire inputs, which the SMIC muxes select
+ * (SWR_MIC4 / SWR_MIC8).
+ */
+static const struct snd_soc_dapm_route sm8750_audio_routes[] = {
+	{ "AMIC1", NULL, "MIC BIAS1" },
+	{ "AMIC4", NULL, "MIC BIAS4" },
+	{ "TX SWR_INPUT4", NULL, "ADC1_OUTPUT" },
+	{ "TX SWR_INPUT8", NULL, "ADC3_OUTPUT" },
+};
+
 static struct snd_soc_card sm8750_card = {
 	.name = "sm8750",
 	.owner = THIS_MODULE,
@@ -530,6 +543,8 @@ static struct snd_soc_card sm8750_card = {
 	.aux_dev = sm8750_aux_devs,
 	.num_aux_devs = ARRAY_SIZE(sm8750_aux_devs),
 	.late_probe = sm8750_late_probe,
+	.dapm_routes = sm8750_audio_routes,
+	.num_dapm_routes = ARRAY_SIZE(sm8750_audio_routes),
 };
 
 static int sm8750_platform_probe(struct platform_device *pdev)
