@@ -1329,6 +1329,57 @@ static const struct regmap_config wcd939x_regmap_config = {
 	.volatile_reg = wcd939x_volatile_register,
 };
 
+/*
+ * The TX channel map above is the grouping the codec uses after reset on the
+ * reference design: ADC1-ADC4 all leave through WCD939X_ADC_1_4_PORT as its
+ * four channels.  A board can be strapped differently, in which case the
+ * channels sit on another data port with a different channel mask, e.g.
+ * ADC3/ADC4 leaving on WCD939X_ADC_DMIC_1_2_PORT as its channels 0/1.  The
+ * layout is a property of the codec configuration on that board, so it comes
+ * from DT rather than being guessed here.
+ *
+ * "qcom,tx-ch-map" holds one <port channel-mask> pair per channel, in the
+ * order of enum wcd939x_tx_sdw_channels.
+ */
+static int wcd939x_parse_tx_ch_map(struct device *dev, struct wcd939x_sdw_priv *wcd)
+{
+	struct wcd_sdw_ch_info *ch_info;
+	u32 map[2 * ARRAY_SIZE(wcd939x_sdw_tx_ch_info)];
+	int i, ret;
+
+	if (!of_property_present(dev->of_node, "qcom,tx-ch-map"))
+		return 0;
+
+	ret = of_property_read_u32_array(dev->of_node, "qcom,tx-ch-map", map,
+					 ARRAY_SIZE(map));
+	if (ret)
+		return dev_err_probe(dev, ret, "invalid qcom,tx-ch-map\n");
+
+	ch_info = devm_kcalloc(dev, ARRAY_SIZE(wcd939x_sdw_tx_ch_info),
+			       sizeof(*ch_info), GFP_KERNEL);
+	if (!ch_info)
+		return -ENOMEM;
+
+	for (i = 0; i < ARRAY_SIZE(wcd939x_sdw_tx_ch_info); i++) {
+		u32 port_num = map[2 * i];
+		u32 ch_mask = map[2 * i + 1];
+
+		if (port_num < WCD939X_ADC_1_4_PORT ||
+		    port_num > WCD939X_MAX_TX_SWR_PORTS || !ch_mask)
+			return dev_err_probe(dev, -EINVAL,
+					     "bad qcom,tx-ch-map entry %d: port %u mask %#x\n",
+					     i, port_num, ch_mask);
+
+		ch_info[i].port_num = port_num;
+		ch_info[i].ch_mask = ch_mask;
+		ch_info[i].master_ch_mask = ch_mask;
+	}
+
+	wcd->ch_info = ch_info;
+
+	return 0;
+}
+
 static const struct sdw_slave_ops wcd9390_slave_ops = {
 	.update_status = wcd_update_status,
 	.interrupt_callback = wcd9390_interrupt_callback,
@@ -1377,6 +1428,9 @@ static int wcd9390_probe(struct sdw_slave *pdev, const struct sdw_device_id *id)
 		pdev->prop.src_dpn_prop = wcd939x_tx_dpn_prop;
 		wcd->ch_info = &wcd939x_sdw_tx_ch_info[0];
 		pdev->prop.wake_capable = true;
+		ret = wcd939x_parse_tx_ch_map(dev, wcd);
+		if (ret)
+			return ret;
 	} else {
 		pdev->prop.sink_ports = GENMASK(WCD939X_MAX_RX_SWR_PORTS - 1, 0);
 		pdev->prop.sink_dpn_prop = wcd939x_rx_dpn_prop;
