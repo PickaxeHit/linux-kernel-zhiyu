@@ -752,6 +752,10 @@ result = data->payload;
 		client_event = APM_CLIENT_EVENT_DATA_READ_DONE;
 		mutex_lock(&graph->lock);
 		rd_done = data->payload;
+		pr_debug("ar-rd: graph %d token %d hw %d st %d size %d off %d\n",
+			 graph->id, hdr->token,
+			 atomic_read(&graph->tx_data.hw_ptr), rd_done->status,
+			 rd_done->data_size, rd_done->offset);
 		if (!graph->tx_data.buf) {
 			mutex_unlock(&graph->lock);
 			break;

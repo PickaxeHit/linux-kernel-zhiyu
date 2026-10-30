@@ -82,6 +82,17 @@ SND_SOC_DAILINK_DEFS(tdm_be,
 		     DAILINK_COMP_ARRAY(COMP_PLATFORM("q6apm-lpass-dais")));
 
 /*
+ * The two microphones are DMIC, clocked by the VA macro and read through the
+ * LPASS codec DMA (VA_CODEC_DMA_TX_0).  The topology owns the capture graph;
+ * this link only has to bind the DSP backend to the macro so the macro is
+ * clocked and its DMIC inputs are powered.
+ */
+SND_SOC_DAILINK_DEFS(tx_capture,
+		     DAILINK_COMP_ARRAY(COMP_CPU("TX_CODEC_DMA_TX_3")),
+		     DAILINK_COMP_ARRAY(COMP_CODEC("6ae0000.codec", "tx_macro_tx1")),
+		     DAILINK_COMP_ARRAY(COMP_PLATFORM("q6apm-lpass-dais")));
+
+/*
  * Vendor resources put the speakers on a 4-slot TDM frame; each amp receives
  * exactly one slot.  Configure both the LPASS side (when the DAI exposes the
  * op) and the codec side from the same numbers.
@@ -232,6 +243,19 @@ static struct snd_soc_dai_link sm8750_dai_links[] = {
 		.be_hw_params_fixup = sm8750_be_hw_params_fixup,
 		SND_SOC_DAILINK_REG(tdm_be),
 	},
+	{
+		.name = "TX Capture",
+		/*
+		 * Must match the capture stream name of the device sub-graph in
+		 * the topology ("<DEVICE> Capture"): that widget is what the
+		 * topology's capture route connects the stream mixer to, and
+		 * DPCM finds backends through exactly that DAPM path.
+		 */
+		.stream_name = "TX_CODEC_DMA_TX_3 Capture",
+		/* pure DPCM backend: the topology's capture PCM drives it */
+		.no_pcm = 1,
+		SND_SOC_DAILINK_REG(tx_capture),
+	},
 };
 
 /*
@@ -261,27 +285,25 @@ static const char * const sm8750_mixer_controls[] = {
 	/* stream sub-graph -> speaker TDM device sub-graph */
 	"SECONDARY_TDM_RX_0 Audio Mixer MultiMedia1",
 	/* stream sub-graph -> DMIC capture device sub-graph */
-	"MultiMedia3 Mixer VA_CODEC_DMA_TX_0",
+	"MultiMedia3 Mixer TX_CODEC_DMA_TX_3",
 };
 
 /*
- * VA macro capture path.  On the vendor stack these are userspace (UCM) mixer
- * controls; here the machine driver owns them so the microphones work without
- * a UCM profile.  The values are the stock "va-mic-dmic" path: DEC0 and DEC1
- * feed the VA AIF1 mixer and their DMIC muxes select DMIC2/DMIC3, the two data
- * lines this board routes (LPI gpio8/gpio9).
+ * TX macro capture path: the built-in microphones are DMIC mics wired to the
+ * TX macro, so DEC2 has to feed AIF1 and its DMIC mux has to select DMIC2 -
+ * the stock "dmic3" mixer path, which the vendor machine driver applies for
+ * its handset-mic device.  These are userspace (UCM) controls on that stack;
+ * here the machine driver owns them.
  */
 static const char * const sm8750_capture_mixer_controls[] = {
-	"VA_AIF1_CAP Mixer DEC0",
-	"VA_AIF1_CAP Mixer DEC1",
+	"TX_AIF1_CAP Mixer DEC2",
 };
 
 static const struct {
 	const char *name;
 	const char *item;
 } sm8750_capture_mux_controls[] = {
-	{ "VA DMIC MUX0", "DMIC2" },
-	{ "VA DMIC MUX1", "DMIC3" },
+	{ "TX DMIC MUX2", "DMIC2" },
 };
 #define SM8750_TDM_MIXER_TRIES 25
 #define SM8750_TDM_MIXER_INTERVAL_MS 200
@@ -507,6 +529,39 @@ static int sm8750_platform_probe(struct platform_device *pdev)
 			dev_dbg(&pdev->dev, "using q6apm bedais node %pOF\n", np);
 		} else {
 			dev_warn(&pdev->dev, "q6apm bedais node not found\n");
+		}
+	}
+
+	/*
+	 * The capture backend uses the same LPASS DAI component and the TX
+	 * macro; both have to be matched by OF node because their components
+	 * are named after the platform device, not after the DT node.
+	 */
+	{
+		unsigned int i;
+
+		for (i = 0; i < ARRAY_SIZE(sm8750_dai_links); i++) {
+			struct snd_soc_dai_link *link = &sm8750_dai_links[i];
+
+			if (strcmp(link->name, "TX Capture"))
+				continue;
+
+			np = of_find_node_by_path("/soc@0/remoteproc@6800000/glink-edge/gpr/service@1/bedais");
+			if (np) {
+				link->platforms[0].of_node = np;
+				link->platforms[0].name = NULL;
+			} else {
+				dev_warn(&pdev->dev, "LPASS bedais node not found\n");
+			}
+
+			np = of_find_node_by_path("/soc@0/codec@6ae0000");
+			if (np) {
+				link->codecs[0].of_node = np;
+				link->codecs[0].name = NULL;
+				link->codecs[0].dai_name = "tx_macro_tx1";
+			} else {
+				dev_warn(&pdev->dev, "TX macro node not found\n");
+			}
 		}
 	}
 
