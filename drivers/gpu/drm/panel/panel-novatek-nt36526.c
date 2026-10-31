@@ -672,17 +672,8 @@ static int zhiyu_init_sequence(struct nt36526 *ctx,
 static const struct panel_info zhiyu_panel_info = {
 	.lanes = 4,
 	.format = MIPI_DSI_FMT_RGB101010,
-	/*
-	 * No MIPI_DSI_CLOCK_NON_CONTINUOUS: that flag parks the clock lane in low
-	 * power during every blanking interval, i.e. it gates the link once per
-	 * frame, and this board turns that gating into a burst of interference in
-	 * the microphone preamp - it is what makes the capture buzz, with a comb
-	 * whose teeth are spaced at the refresh rate.  The vendor configuration for
-	 * this panel keeps the clock running (bllp-power-mode only parks the data
-	 * lanes).
-	 */
 	.mode_flags = MIPI_DSI_MODE_VIDEO | MIPI_DSI_MODE_VIDEO_BURST |
-		      MIPI_DSI_MODE_LPM |
+		      MIPI_DSI_CLOCK_NON_CONTINUOUS | MIPI_DSI_MODE_LPM |
 		      MIPI_DSI_MODE_DSC_ALL_SLICES_IN_PKT,
 	.modes = zhiyu_display_modes,
 	.num_modes = ARRAY_SIZE(zhiyu_display_modes),
