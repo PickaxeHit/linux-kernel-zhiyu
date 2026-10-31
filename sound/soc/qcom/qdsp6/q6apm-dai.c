@@ -632,6 +632,15 @@ static int q6apm_dai_pcm_new(struct snd_soc_component *component, struct snd_soc
 	 * four anonymous AUX channels, so stereo is mixed onto all four.
 	 */
 	static const struct snd_pcm_chmap_elem q6apm_chmap_4ch[] = {
+		/*
+		 * Publish a map for every supported channel count: PipeWire
+		 * asks the card for the map matching the requested channels
+		 * and refuses to build the node when none matches, so a
+		 * stereo stream needs a stereo entry here even though the
+		 * hardware side always runs four slots.
+		 */
+		{ .channels = 2,
+		  .map = { SNDRV_CHMAP_FL, SNDRV_CHMAP_FR } },
 		{ .channels = 4,
 		  .map = { SNDRV_CHMAP_FL, SNDRV_CHMAP_FR,
 			   SNDRV_CHMAP_RL, SNDRV_CHMAP_RR } },
