@@ -144,15 +144,8 @@ static void dsi_pll_setup_config(struct dsi_pll_config *config)
 	config->ssc_offset = 4800;
 	config->ssc_adj_per = 2;
 
-	/*
-	 * Spread spectrum on the DSI PLL.  The vendor tree enables it
-	 * (qcom,dsi-pll-ssc-en with down-spread) and the calculation and commit
-	 * paths below were already here; only the switch was missing.  Without
-	 * it the DSI link's energy sits in narrow peaks that this board couples
-	 * into the microphone preamp, and, because the amount of data on the
-	 * link follows the picture, the interference follows the content too.
-	 */
-	config->enable_ssc = true;
+	/* TODO: ssc enable */
+	config->enable_ssc = false;
 	config->ssc_center = 0;
 }
 
