@@ -304,12 +304,17 @@ static int __maybe_unused dw9807_vcm_suspend(struct device *dev)
 	 * past its near limit, and it also loses the position between the
 	 * short open/set/close cycles used by v4l2-ctl.
 	 */
-	/*
-	 * Do not power the driver down here: the coil would release and the
-	 * lens would spring back between the short open/set/close cycles.
-	 * The rail is dropped at the end of the session instead.
-	 */
 	(void)tx_data;
+
+	/*
+	 * Drop the rail when the sub-device is closed, i.e. when the camera
+	 * stops streaming.  Leaving the actuator energised does nothing useful
+	 * once the lens has been positioned, it just heats the coil; the lens
+	 * relaxes to its rest position, which is fine because a new stream runs
+	 * a fresh autofocus search.
+	 */
+	if (dw9807_dev->vdd)
+		regulator_disable(dw9807_dev->vdd);
 
 	return 0;
 }
