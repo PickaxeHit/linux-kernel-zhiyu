@@ -921,6 +921,7 @@ static int audioreach_widget_load_buffer(struct snd_soc_component *component,
 		ret = audioreach_widget_audio_if_module_load(mod, mod_array);
 		if (ret)
 			return ret;
+		break;
 	case MODULE_ID_TDM_SINK:
 		/*
 		 * The TDM endpoint shares the I2S interface tokens (hw-if idx,

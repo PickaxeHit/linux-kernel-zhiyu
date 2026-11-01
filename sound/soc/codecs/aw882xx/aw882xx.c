@@ -81,10 +81,15 @@ static struct aw_componet_codec_ops aw_componet_codec_ops = {
 	.add_codec_controls = snd_soc_add_component_controls,
 #ifdef AW_KERNEL_VER_OVER_6_18_12
 	.unregister_codec = snd_soc_unregister_component_by_driver,
+	/*
+	 * snd_soc_register_component() became a _Generic macro that dispatches on
+	 * the first argument, so it can no longer be used as a function pointer.
+	 */
+	.register_codec = snd_soc_register_component_d,
 #else
 	.unregister_codec = snd_soc_unregister_component,
-#endif
 	.register_codec = snd_soc_register_component,
+#endif
 };
 #else
 static struct aw_componet_codec_ops aw_componet_codec_ops = {

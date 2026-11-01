@@ -428,7 +428,6 @@ static int q6apm_lpass_dai_prepare(struct snd_pcm_substream *substream, struct s
 	struct q6apm_lpass_dai_data *dai_data = dev_get_drvdata(dai->dev);
 	struct audioreach_module_config *cfg = &dai_data->module_config[dai->id];
 	struct q6apm_graph *graph;
-	int graph_id = dai->id;
 	int gid = q6apm_lpass_dai_graph_id(dai);
 	int rc;
 
