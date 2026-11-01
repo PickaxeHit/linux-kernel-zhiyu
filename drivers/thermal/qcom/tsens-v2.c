@@ -271,6 +271,20 @@ struct tsens_plat_data data_tsens_v2 = {
 	.fields	= tsens_v2_regfields,
 };
 
+/*
+ * The trip interrupts are level based and armed on the thresholds the thermal
+ * zones program.  The lower threshold fires as soon as the SoC cools down, so
+ * keeping the interrupts wakeup capable makes a suspended board wake up a
+ * second or two after it went to sleep; a thermal trip has nothing to report
+ * to a sleeping system.
+ */
+struct tsens_plat_data data_sm8750 = {
+	.ops		= &ops_generic_v2,
+	.feat		= &tsens_v2_feat,
+	.fields	= tsens_v2_regfields,
+	.no_irq_wake	= true,
+};
+
 struct tsens_plat_data data_ipq8074 = {
 	.ops		= &ops_generic_v2,
 	.feat		= &ipq8074_feat,
