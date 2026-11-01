@@ -293,18 +293,6 @@ static int __maybe_unused dw9807_vcm_suspend(struct device *dev)
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct dw9807_device *dw9807_dev = sd_to_dw9807_vcm(sd);
-	const char tx_data[2] = { DW9807_CTL_ADDR, 0x01 };
-	int ret;
-
-	if (dw9807_dev->vdd)
-		regulator_disable(dw9807_dev->vdd);
-
-	/*
-	 * Park the lens where it is: ramping down to 0 drives this actuator
-	 * past its near limit, and it also loses the position between the
-	 * short open/set/close cycles used by v4l2-ctl.
-	 */
-	(void)tx_data;
 
 	/*
 	 * Drop the rail when the sub-device is closed, i.e. when the camera
@@ -312,6 +300,11 @@ static int __maybe_unused dw9807_vcm_suspend(struct device *dev)
 	 * once the lens has been positioned, it just heats the coil; the lens
 	 * relaxes to its rest position, which is fine because a new stream runs
 	 * a fresh autofocus search.
+	 *
+	 * The rail is shared with the sensor module, so it must be dropped
+	 * exactly once per resume.  An extra disable here takes the rail away
+	 * from the sensor that is still using it and leaves the regulator
+	 * refcount corrupted for every other consumer.
 	 */
 	if (dw9807_dev->vdd)
 		regulator_disable(dw9807_dev->vdd);
