@@ -46,6 +46,7 @@ struct dw9807_device {
 	struct v4l2_subdev sd;
 	struct regulator *vdd;
 	u16 current_val;
+	bool parked;
 };
 
 static inline struct dw9807_device *sd_to_dw9807_vcm(
@@ -280,32 +281,56 @@ static void dw9807_remove(struct i2c_client *client)
 
 	pm_runtime_disable(&client->dev);
 
+	/* Do not leave the shared rail enabled without a consumer behind. */
+	if (!pm_runtime_status_suspended(&client->dev) && dw9807_dev->vdd)
+		regulator_disable(dw9807_dev->vdd);
+
 	dw9807_subdev_cleanup(dw9807_dev);
 }
 
 /*
- * This function sets the vcm position, so it consumes least current
- * The lens position is gradually moved in units of DW9807_CTRL_STEPS,
- * to make the movements smoothly.
+ * Move the lens to @val in DW9807_CTRL_STEPS steps.  A single write makes the
+ * lens holder slam into its new position, which is audible; stepping it over a
+ * few milliseconds is not.
  */
-static int __maybe_unused dw9807_vcm_suspend(struct device *dev)
+static void dw9807_dac_ramp(struct i2c_client *client, unsigned int from,
+			    unsigned int val)
+{
+	while (from != val) {
+		if (from < val)
+			from = min(from + DW9807_CTRL_STEPS, val);
+		else
+			from = max(from, DW9807_CTRL_STEPS) - DW9807_CTRL_STEPS;
+
+		if (dw9807_set_dac(client, from))
+			return;
+		usleep_range(DW9807_CTRL_DELAY_US, DW9807_CTRL_DELAY_US + 10);
+	}
+}
+
+/*
+ * Runtime suspend is where the actuator is powered off: it runs when the last
+ * user closes the sub-device, i.e. when the camera stops streaming.  The lens
+ * is parked first so that cutting the rail cannot make it snap, and the rail
+ * itself is dropped afterwards because the actuator and the sensor module share
+ * it and it would otherwise heat the coil for nothing.
+ */
+static int __maybe_unused dw9807_vcm_runtime_suspend(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
 	struct dw9807_device *dw9807_dev = sd_to_dw9807_vcm(sd);
+	const char tx_data[2] = { DW9807_CTL_ADDR, 0x00 };
 
-	/*
-	 * Drop the rail when the sub-device is closed, i.e. when the camera
-	 * stops streaming.  Leaving the actuator energised does nothing useful
-	 * once the lens has been positioned, it just heats the coil; the lens
-	 * relaxes to its rest position, which is fine because a new stream runs
-	 * a fresh autofocus search.
-	 *
-	 * The rail is shared with the sensor module, so it must be dropped
-	 * exactly once per resume.  An extra disable here takes the rail away
-	 * from the sensor that is still using it and leaves the regulator
-	 * refcount corrupted for every other consumer.
-	 */
+	if (dw9807_dev->current_val) {
+		dw9807_dac_ramp(client, dw9807_dev->current_val, 0);
+		dw9807_dev->parked = true;
+	}
+
+	/* Power down */
+	if (i2c_master_send(client, tx_data, sizeof(tx_data)) < 0)
+		dev_dbg(&client->dev, "power-down write failed\n");
+
 	if (dw9807_dev->vdd)
 		regulator_disable(dw9807_dev->vdd);
 
@@ -313,12 +338,10 @@ static int __maybe_unused dw9807_vcm_suspend(struct device *dev)
 }
 
 /*
- * This function sets the vcm position to the value set by the user
- * through v4l2_ctrl_ops s_ctrl handler
- * The lens position is gradually moved in units of DW9807_CTRL_STEPS,
- * to make the movements smoothly.
+ * Bring the actuator back: rail first, then the power-on sequence, then the
+ * position the user set last, ramped up so the lens does not jump.
  */
-static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
+static int __maybe_unused dw9807_vcm_runtime_resume(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct v4l2_subdev *sd = i2c_get_clientdata(client);
@@ -326,7 +349,6 @@ static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
 	const char tx_data[2] = { DW9807_CTL_ADDR, 0x00 };
 	int ret;
 
-	/* The actuator shares the camera's 2.8V rail; bring it up first. */
 	if (dw9807_dev->vdd) {
 		ret = regulator_enable(dw9807_dev->vdd);
 		if (ret)
@@ -335,13 +357,13 @@ static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
 	}
 
 	/*
-	 * Power on.  The actuator shares the camera module's rails and only
-	 * answers once the *sensor* is streaming, so the first resume after
-	 * boot (during camera enumeration) may well find it unpowered.  That
-	 * must not fail the resume: the runtime-PM core latches the device into
-	 * "error" and then every later open() of the subdev fails with EINVAL,
-	 * which is exactly what made libcamera's focus control unusable.  Try,
-	 * warn, and let the position writes report the error if it matters.
+	 * The actuator shares the camera module's rails and only answers once
+	 * the *sensor* is streaming, so the first resume after boot (during
+	 * camera enumeration) may well find it unpowered.  That must not fail
+	 * the resume: the runtime-PM core latches the device into "error" and
+	 * then every later open() of the subdev fails with EINVAL, which is
+	 * exactly what made libcamera's focus control unusable.  Try, warn, and
+	 * let the position writes report the error if it matters.
 	 */
 	ret = i2c_master_send(client, tx_data, sizeof(tx_data));
 	if (ret < 0)
@@ -350,11 +372,13 @@ static int  __maybe_unused dw9807_vcm_resume(struct device *dev)
 			ret);
 
 	usleep_range(1000, 2000);
-	if (dw9807_dev->current_val)
-		dw9807_set_dac(client, dw9807_dev->current_val);
+
+	if (dw9807_dev->parked) {
+		dw9807_dev->parked = false;
+		dw9807_dac_ramp(client, 0, dw9807_dev->current_val);
+	}
 
 	return 0;
-
 }
 
 static const struct of_device_id dw9807_of_table[] = {
@@ -366,8 +390,15 @@ static const struct of_device_id dw9807_of_table[] = {
 MODULE_DEVICE_TABLE(of, dw9807_of_table);
 
 static const struct dev_pm_ops dw9807_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(dw9807_vcm_suspend, dw9807_vcm_resume)
-	SET_RUNTIME_PM_OPS(dw9807_vcm_suspend, dw9807_vcm_resume, NULL)
+	/*
+	 * Deliberately no system sleep callbacks: the shared camera rail and the
+	 * lens position belong to runtime PM.  Wiring the same power on/off into
+	 * system sleep made every suspend attempt drop the rail of a camera that
+	 * was not even in use and then drive the actuator back to its last
+	 * position, which is heard as a click.
+	 */
+	SET_RUNTIME_PM_OPS(dw9807_vcm_runtime_suspend, dw9807_vcm_runtime_resume,
+			   NULL)
 };
 
 static struct i2c_driver dw9807_i2c_driver = {
