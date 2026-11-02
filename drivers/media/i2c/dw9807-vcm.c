@@ -322,10 +322,14 @@ static int __maybe_unused dw9807_vcm_runtime_suspend(struct device *dev)
 	struct dw9807_device *dw9807_dev = sd_to_dw9807_vcm(sd);
 	const char tx_data[2] = { DW9807_CTL_ADDR, 0x00 };
 
-	if (dw9807_dev->current_val) {
-		dw9807_dac_ramp(client, dw9807_dev->current_val, 0);
+	/*
+	 * Do not ramp the actuator to 0 first: cutting the rail lets the lens
+	 * settle on its own, and driving it to the near stop would make the
+	 * lens move every time the camera is closed.  Only remember that the
+	 * position has to be restored, since the DAC loses it with the rail.
+	 */
+	if (dw9807_dev->current_val)
 		dw9807_dev->parked = true;
-	}
 
 	/* Power down */
 	if (i2c_master_send(client, tx_data, sizeof(tx_data)) < 0)
