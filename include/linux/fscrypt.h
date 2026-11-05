@@ -1059,4 +1059,13 @@ static inline int fscrypt_encrypt_symlink(struct inode *inode,
 	return 0;
 }
 
+/* Match Android metadata encryption, including keyless ciphertext migration. */
+static inline bool
+fscrypt_inode_should_skip_dm_default_key(const struct inode *inode)
+{
+	return IS_ENABLED(CONFIG_FS_ENCRYPTION) &&
+		IS_ENABLED(CONFIG_DM_INLINECRYPT) &&
+		IS_ENCRYPTED(inode) && S_ISREG(inode->i_mode);
+}
+
 #endif	/* _LINUX_FSCRYPT_H */

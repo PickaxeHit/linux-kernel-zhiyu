@@ -5474,7 +5474,8 @@ reset_checkpoint:
 
 	if (test_opt(sbi, DISABLE_CHECKPOINT))
 		err = f2fs_disable_checkpoint(sbi);
-	else if (is_set_ckpt_flags(sbi, CP_DISABLED_FLAG))
+	/* A read-only inspection must not try to write a new checkpoint. */
+	else if (is_set_ckpt_flags(sbi, CP_DISABLED_FLAG) && !f2fs_readonly(sb))
 		err = f2fs_enable_checkpoint(sbi);
 	if (err)
 		goto sync_free_meta;

@@ -508,6 +508,7 @@ struct fscrypt_master_key_secret {
 	 * support newer functionality such as hardware-wrapped keys.
 	 */
 	bool			is_hw_wrapped;
+	bool			is_hw_wrapped_v0;
 
 	/*
 	 * Size of the key in bytes.  This remains set even if ->bytes was

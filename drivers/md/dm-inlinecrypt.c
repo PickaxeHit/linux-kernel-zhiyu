@@ -389,6 +389,13 @@ static int inlinecrypt_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		if (err)
 			goto bad;
 	}
+	/* The FBE target only supports hardware-wrapped inline file keys. */
+	if (dm_target_passes_crypto(ti->type) &&
+	    ctx->key_type != BLK_CRYPTO_KEY_TYPE_HW_WRAPPED) {
+		ti->error = "inlinecrypt-fbe requires hw-wrapped keys";
+		err = -EINVAL;
+		goto bad;
+	}
 	ctx->sector_bits = ilog2(ctx->sector_size);
 	if (ti->len & ((ctx->sector_size >> SECTOR_SHIFT) - 1)) {
 		ti->error = "Device size is not a multiple of sector_size";
@@ -447,17 +454,19 @@ static int inlinecrypt_map(struct dm_target *ti, struct bio *bio)
 	if (bio_sectors(bio) == 0)
 		return DM_MAPIO_REMAPPED;
 
-	/*
-	 * The bio should never have an encryption context already, since
-	 * dm-inlinecrypt doesn't pass through any inline encryption
-	 * capabilities to the layer above it.
-	 */
-	if (WARN_ON_ONCE(bio_has_crypt_ctx(bio)))
-		return DM_MAPIO_KILL;
-
-	/* Map the bio's sector to the underlying device. (512-byte sectors) */
+	/* File-data DUNs belong to fscrypt; only remap their disk sectors. */
 	sector_in_target = dm_target_offset(ti, bio->bi_iter.bi_sector);
 	bio->bi_iter.bi_sector = ctx->start + sector_in_target;
+	if (dm_target_passes_crypto(ti->type) &&
+	    bio_should_skip_dm_default_key(bio))
+		return DM_MAPIO_REMAPPED;
+	if (bio_has_crypt_ctx(bio)) {
+		if (dm_target_passes_crypto(ti->type))
+			return DM_MAPIO_REMAPPED;
+		WARN_ON_ONCE(1);
+		return DM_MAPIO_KILL;
+	}
+
 	/*
 	 * If the bio doesn't have any data (e.g. if it's a DISCARD request),
 	 * there's nothing more to do.
@@ -612,7 +621,43 @@ static struct target_type inlinecrypt_target = {
 	.io_hints		= inlinecrypt_io_hints,
 };
 
-module_dm(inlinecrypt);
+/* Opt-in Android wrapped-key FBE mapping. Ordinary inlinecrypt is unchanged. */
+static struct target_type inlinecrypt_fbe_target = {
+	.name			= "inlinecrypt-fbe",
+	.version		= {1, 0, 0},
+	.features		= DM_TARGET_PASSES_CRYPTO,
+	.module			= THIS_MODULE,
+	.ctr			= inlinecrypt_ctr,
+	.dtr			= inlinecrypt_dtr,
+	.map			= inlinecrypt_map,
+	.status			= inlinecrypt_status,
+	.prepare_ioctl		= inlinecrypt_prepare_ioctl,
+	.iterate_devices	= inlinecrypt_iterate_devices,
+	.io_hints		= inlinecrypt_io_hints,
+};
+
+static int __init inlinecrypt_init(void)
+{
+	int err = dm_register_target(&inlinecrypt_target);
+
+	if (err)
+		return err;
+	err = dm_register_target(&inlinecrypt_fbe_target);
+	if (err)
+		dm_unregister_target(&inlinecrypt_target);
+	return err;
+}
+
+static void __exit inlinecrypt_exit(void)
+{
+	dm_unregister_target(&inlinecrypt_fbe_target);
+	dm_unregister_target(&inlinecrypt_target);
+}
+
+module_init(inlinecrypt_init);
+module_exit(inlinecrypt_exit);
+MODULE_ALIAS("dm-inlinecrypt");
+MODULE_ALIAS("dm-inlinecrypt-fbe");
 
 MODULE_AUTHOR("Eric Biggers <ebiggers@google.com>");
 MODULE_AUTHOR("Linlin Zhang <linlin.zhang@oss.qualcomm.com>");

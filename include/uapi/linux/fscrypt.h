@@ -128,6 +128,8 @@ struct fscrypt_add_key_arg {
 	__u32 raw_size;
 	__u32 key_id;
 #define FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED	0x00000001
+/* Android wrappedkey_v0 identifier compatibility; requires CAP_SYS_ADMIN. */
+#define FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED_V0	0x00000002
 	__u32 flags;
 	__u32 __reserved[7];
 	__u8 raw[];

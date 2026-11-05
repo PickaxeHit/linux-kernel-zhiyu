@@ -559,8 +559,10 @@ static int add_master_key(struct super_block *sb,
 			 * different key identifiers by deriving their key
 			 * identifiers using different KDF contexts.
 			 */
-			keyid_kdf_ctx =
-				HKDF_CONTEXT_KEY_IDENTIFIER_FOR_HW_WRAPPED_KEY;
+			/* Existing Android wrappedkey_v0 policies use context 1. */
+			if (!secret->is_hw_wrapped_v0)
+				keyid_kdf_ctx =
+					HKDF_CONTEXT_KEY_IDENTIFIER_FOR_HW_WRAPPED_KEY;
 		}
 		fscrypt_init_hkdf(&secret->hkdf, kdf_key, kdf_key_size);
 		/*
@@ -606,7 +608,8 @@ static int fscrypt_provisioning_key_preparse(struct key_preparsed_payload *prep)
 	    payload->type != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER)
 		return -EINVAL;
 
-	if (payload->flags & ~FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED)
+	if (payload->flags & ~(FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED |
+			       FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED_V0))
 		return -EINVAL;
 
 	prep->payload.data[0] = kmemdup(payload, prep->datalen, GFP_KERNEL);
@@ -754,10 +757,18 @@ int fscrypt_ioctl_add_key(struct file *filp, void __user *_uarg)
 	memset(&secret, 0, sizeof(secret));
 
 	if (arg.flags) {
-		if (arg.flags & ~FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED)
+		if (arg.flags & ~(FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED |
+			  FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED_V0))
 			return -EINVAL;
 		if (arg.key_spec.type != FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER)
 			return -EINVAL;
+		if (!(arg.flags & FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED))
+			return -EINVAL;
+		if (arg.flags & FSCRYPT_ADD_KEY_FLAG_HW_WRAPPED_V0) {
+			if (!capable(CAP_SYS_ADMIN))
+				return -EPERM;
+			secret.is_hw_wrapped_v0 = true;
+		}
 		secret.is_hw_wrapped = true;
 	}
 
