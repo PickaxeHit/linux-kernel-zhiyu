@@ -258,5 +258,6 @@ config SND_SOC_SM8750
 	tristate "ASoC support for SM8750"
 	depends on SND_SOC_QCOM
 	select SND_SOC_QCOM_COMMON
+	select SND_SOC_QCOM_SDW
 	help
 	  Say Y to enable ASoC support for the Qualcomm SM8750 platform.
