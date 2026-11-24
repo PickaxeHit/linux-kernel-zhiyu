@@ -68,6 +68,17 @@ properties:
     $ref: /schemas/types.yaml#/definitions/phandle
     description: phandle to the Inline Crypto Engine node
 
+  qcom,icc-sleep-floor-kbps:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    description:
+      Minimum peak bandwidth in kilobytes per second for the ufs-ddr and
+      cpu-ufs interconnect paths, including during system suspend. Some
+      boards require these votes in the RPMh sleep state to resume reliably.
+
+dependencies:
+  qcom,icc-sleep-floor-kbps: [interconnects, interconnect-names]
+
 required:
   - compatible
   - reg

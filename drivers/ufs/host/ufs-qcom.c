@@ -15,11 +15,13 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/property.h>
 #include <linux/reset-controller.h>
 #include <linux/time.h>
 #include <linux/unaligned.h>
 #include <linux/units.h>
 
+#include <dt-bindings/interconnect/qcom,icc.h>
 #include <soc/qcom/ice.h>
 
 #include <ufs/ufshcd.h>
@@ -1531,6 +1533,40 @@ static const struct reset_control_ops ufs_qcom_reset_ops = {
 	.deassert = ufs_qcom_reset_deassert,
 };
 
+static int ufs_qcom_icc_init_sleep_floor(struct device *dev)
+{
+	static const char *const names[] = { "ufs-ddr", "cpu-ufs" };
+	struct icc_path *path;
+	u32 peak;
+	int ret, i;
+
+	if (!device_property_present(dev, "qcom,icc-sleep-floor-kbps"))
+		return 0;
+
+	ret = device_property_read_u32(dev, "qcom,icc-sleep-floor-kbps", &peak);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to read interconnect floor\n");
+
+	/*
+	 * Keep independent requests so clock gating and gear changes can still
+	 * drop or update the regular UFS votes. The floor must also reach the
+	 * RPMh sleep bucket, since a vote for active and wake alone is too late.
+	 */
+	for (i = 0; i < ARRAY_SIZE(names); i++) {
+		path = devm_of_icc_get(dev, names[i]);
+		if (IS_ERR(path))
+			return dev_err_probe(dev, PTR_ERR(path),
+					     "failed to acquire %s floor path\n", names[i]);
+
+		icc_set_tag(path, QCOM_ICC_TAG_ALWAYS);
+		ret = icc_set_bw(path, 1, peak);
+		if (ret)
+			return dev_err_probe(dev, ret, "failed to set %s floor\n", names[i]);
+	}
+
+	return 0;
+}
+
 static int ufs_qcom_icc_init(struct ufs_qcom_host *host)
 {
 	struct device *dev = host->hba->dev;
@@ -1556,7 +1592,7 @@ static int ufs_qcom_icc_init(struct ufs_qcom_host *host)
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "failed to set bandwidth request\n");
 
-	return 0;
+	return ufs_qcom_icc_init_sleep_floor(dev);
 }
 
 /**
