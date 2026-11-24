@@ -552,21 +552,23 @@ static void fastrpc_channel_ctx_put(struct fastrpc_channel_ctx *cctx)
 	kref_put(&cctx->refcount, fastrpc_channel_ctx_free);
 }
 
-static void fastrpc_context_put(struct fastrpc_invoke_ctx *ctx);
+static void fastrpc_session_free(struct fastrpc_channel_ctx *cctx,
+				 struct fastrpc_session_ctx *session)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&cctx->lock, flags);
+	session->used = false;
+	spin_unlock_irqrestore(&cctx->lock, flags);
+}
 
 static void fastrpc_user_free(struct kref *ref)
 {
 	struct fastrpc_user *fl = container_of(ref, struct fastrpc_user, refcount);
-	struct fastrpc_invoke_ctx *ctx, *n;
 	struct fastrpc_map *map, *m;
 	struct fastrpc_buf *buf, *b;
 
 	fastrpc_buf_free(fl->init_mem);
-
-	list_for_each_entry_safe(ctx, n, &fl->pending, node) {
-		list_del(&ctx->node);
-		fastrpc_context_put(ctx);
-	}
 
 	list_for_each_entry_safe(map, m, &fl->maps, node)
 		fastrpc_map_put(map);
@@ -576,6 +578,7 @@ static void fastrpc_user_free(struct kref *ref)
 		fastrpc_buf_free(buf);
 	}
 
+	fastrpc_session_free(fl->cctx, fl->sctx);
 	fastrpc_channel_ctx_put(fl->cctx);
 	mutex_destroy(&fl->mutex);
 	kfree(fl);
@@ -1708,16 +1711,6 @@ static struct fastrpc_session_ctx *fastrpc_session_alloc(
 	return session;
 }
 
-static void fastrpc_session_free(struct fastrpc_channel_ctx *cctx,
-				 struct fastrpc_session_ctx *session)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&cctx->lock, flags);
-	session->used = false;
-	spin_unlock_irqrestore(&cctx->lock, flags);
-}
-
 static int fastrpc_release_current_dsp_process(struct fastrpc_user *fl)
 {
 	struct fastrpc_invoke_args args[1];
@@ -1738,7 +1731,9 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 {
 	struct fastrpc_user *fl = (struct fastrpc_user *)file->private_data;
 	struct fastrpc_channel_ctx *cctx = fl->cctx;
+	struct fastrpc_invoke_ctx *ctx, *next;
 	unsigned long flags;
+	LIST_HEAD(pending);
 
 	fastrpc_release_current_dsp_process(fl);
 
@@ -1746,7 +1741,20 @@ static int fastrpc_device_release(struct inode *inode, struct file *file)
 	list_del(&fl->user);
 	spin_unlock_irqrestore(&cctx->lock, flags);
 
-	fastrpc_session_free(cctx, fl->sctx);
+	/*
+	 * Interrupted calls can remain on the pending list with a reference
+	 * to fl. Drop the caller's references before releasing the file's
+	 * reference. An outstanding DSP reply still owns its own reference.
+	 */
+	spin_lock(&fl->lock);
+	list_splice_init(&fl->pending, &pending);
+	spin_unlock(&fl->lock);
+
+	list_for_each_entry_safe(ctx, next, &pending, node) {
+		list_del_init(&ctx->node);
+		fastrpc_context_put(ctx);
+	}
+
 	file->private_data = NULL;
 	/* Release the reference taken in fastrpc_device_open */
 	fastrpc_user_put(fl);
